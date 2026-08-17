@@ -23,6 +23,8 @@ services:
       - key: OPENAI_ADMIN_MODEL
         value: gpt-5.6
       - key: OPENAI_VOICE_REPLY_MODEL
+        value: gpt-5.6-luna
+      - key: OPENAI_VOICE_DEEP_MODEL
         value: gpt-5.6-terra
       - key: OPENAI_TRANSCRIBE_MODEL
         value: gpt-4o-transcribe

@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 APP_NAME = "LJ AI V13 Cloud"
-APP_VERSION = "13.0.0"
+APP_VERSION = "13.2.0"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -36,7 +36,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 OPENAI_USER_MODEL = os.getenv("OPENAI_USER_MODEL", "gpt-5-mini").strip()
 OPENAI_ADMIN_MODEL = os.getenv("OPENAI_ADMIN_MODEL", "gpt-5.6").strip()
-OPENAI_VOICE_REPLY_MODEL = os.getenv("OPENAI_VOICE_REPLY_MODEL", "gpt-5.6-terra").strip()
+OPENAI_VOICE_REPLY_MODEL = os.getenv("OPENAI_VOICE_REPLY_MODEL", "gpt-5.6-luna").strip()
+OPENAI_VOICE_DEEP_MODEL = os.getenv("OPENAI_VOICE_DEEP_MODEL", "gpt-5.6-terra").strip()
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe").strip()
 OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "cedar").strip()
@@ -282,7 +283,7 @@ async def _load_profile(user_id: str) -> dict[str, Any]:
 
 async def _mark_seen(user_id: str) -> None:
     now = time.monotonic()
-    if now - _seen_updates.get(user_id, 0.0) < 300:
+    if now - _seen_updates.get(user_id, 0.0) < 40:
         return
     _seen_updates[user_id] = now
     try:
@@ -596,6 +597,12 @@ async def me(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     }
 
 
+@app.post("/v1/presence")
+async def presence(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+    """Authenticated lightweight heartbeat used by the desktop online counter."""
+    return {"online": True, "user_id": identity.user_id}
+
+
 @app.get("/v1/plans")
 async def plans() -> Any:
     rows = await _rest_request(
@@ -728,6 +735,19 @@ async def _save_chat_log(
         pass
 
 
+def _voice_needs_deeper_reasoning(message: str, detail: str) -> bool:
+    """Keep ordinary speech quick while preserving extra thought for complex requests."""
+    text = " ".join(message.casefold().split())
+    if detail == "DETAILED" or len(text) > 260:
+        return True
+    deeper_phrases = (
+        "explain in detail", "step by step", "analyse", "analyze", "compare",
+        "troubleshoot", "write code", "make a plan", "solve this", "why exactly",
+        "think carefully", "research",
+    )
+    return any(phrase in text for phrase in deeper_phrases)
+
+
 @app.post("/v1/chat")
 async def chat(
     body: ChatRequest,
@@ -748,10 +768,15 @@ async def chat(
         )
 
     model = OPENAI_ADMIN_MODEL if identity.role == "ADMIN" else OPENAI_USER_MODEL
+    deep_voice_request = body.from_voice and _voice_needs_deeper_reasoning(body.message, body.detail)
     if body.from_voice:
-        model = OPENAI_VOICE_REPLY_MODEL
-    max_output_tokens = {"CONCISE": 500, "BALANCED": 1000, "DETAILED": 1600}[body.detail]
-    conversation = [turn.model_dump() for turn in body.history[-MAX_HISTORY_TURNS:]]
+        model = OPENAI_VOICE_DEEP_MODEL if deep_voice_request else OPENAI_VOICE_REPLY_MODEL
+        max_output_tokens = {"CONCISE": 220, "BALANCED": 360, "DETAILED": 700}[body.detail]
+        history_turns = 12 if deep_voice_request else 8
+    else:
+        max_output_tokens = {"CONCISE": 500, "BALANCED": 1000, "DETAILED": 1600}[body.detail]
+        history_turns = MAX_HISTORY_TURNS
+    conversation = [turn.model_dump() for turn in body.history[-history_turns:]]
     conversation.append({"role": "user", "content": body.message})
     payload: dict[str, Any] = {
         "model": model,
@@ -759,7 +784,10 @@ async def chat(
         "input": conversation,
         "max_output_tokens": max_output_tokens,
     }
-    if OPENAI_REASONING_EFFORT:
+    if body.from_voice:
+        payload["text"] = {"verbosity": "medium" if deep_voice_request else "low"}
+        payload["reasoning"] = {"effort": "medium" if deep_voice_request else "low"}
+    elif OPENAI_REASONING_EFFORT:
         payload["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
 
     data = await _openai_json("responses", payload)
@@ -1093,7 +1121,7 @@ async def admin_users(identity: Identity = Depends(current_identity)) -> list[di
             "limit": "1000",
         },
     ) or []
-    online_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+    online_cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
     for row in rows:
         last_seen = _parse_timestamp(row.get("last_seen_at"))
         row["online"] = bool(last_seen and last_seen >= online_cutoff)
