@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: jarvis-v13-cloud
+    runtime: python
+    plan: free
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.11
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_USER_MODEL
+        value: gpt-5-mini
+      - key: OPENAI_ADMIN_MODEL
+        value: gpt-5.6
+      - key: OPENAI_VOICE_REPLY_MODEL
+        value: gpt-5.6-terra
+      - key: OPENAI_TRANSCRIBE_MODEL
+        value: gpt-transcribe
+      - key: OPENAI_TTS_MODEL
+        value: gpt-4o-mini-tts
+      - key: OPENAI_TTS_VOICE
+        value: cedar
+      - key: OPENAI_REASONING_EFFORT
+        value: low
+
