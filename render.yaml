@@ -25,11 +25,10 @@ services:
       - key: OPENAI_VOICE_REPLY_MODEL
         value: gpt-5.6-terra
       - key: OPENAI_TRANSCRIBE_MODEL
-        value: gpt-transcribe
+        value: gpt-4o-transcribe
       - key: OPENAI_TTS_MODEL
         value: gpt-4o-mini-tts
       - key: OPENAI_TTS_VOICE
         value: cedar
       - key: OPENAI_REASONING_EFFORT
         value: low
-
