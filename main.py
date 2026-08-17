@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 APP_NAME = "LJ AI V13 Cloud"
-APP_VERSION = "13.2.0"
+APP_VERSION = "13.2.2"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -155,6 +155,34 @@ async def _auth_request(
         raise HTTPException(
             status_code=response.status_code if response.status_code < 500 else 502,
             detail=_safe_upstream_message(response, "Authentication request failed."),
+        )
+    if not response.content:
+        return {}
+    return response.json()
+
+
+async def _auth_admin_request(
+    method: str,
+    path: str,
+    *,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Call a Supabase Auth admin endpoint using only the server-side secret."""
+    _require_configuration()
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            response = await client.request(
+                method,
+                f"{SUPABASE_URL}/auth/v1/{path.lstrip('/')}",
+                headers=_service_headers(),
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=503, detail="Authentication service is unavailable.") from exc
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code if response.status_code < 500 else 502,
+            detail=_safe_upstream_message(response, "Account creation failed."),
         )
     if not response.content:
         return {}
@@ -510,26 +538,31 @@ async def client_update() -> dict[str, Any]:
 async def signup(body: SignUpRequest, request: Request) -> dict[str, Any]:
     client_ip = request.client.host if request.client else "unknown"
     await limiter.enforce(f"signup:{client_ip}", 5, 3600)
-    result = await _auth_request(
+    created = await _auth_admin_request(
         "POST",
-        "signup",
+        "admin/users",
         payload={
             "email": body.email,
             "password": body.password,
-            "data": {"username": body.username},
+            "email_confirm": True,
+            "user_metadata": {"username": body.username},
         },
     )
-    user = result.get("user") or {}
-    session_created = bool(result.get("access_token"))
+    user = created.get("user") if isinstance(created.get("user"), dict) else created
+    if not isinstance(user, dict) or not user.get("id"):
+        raise HTTPException(status_code=502, detail="The authentication service did not create the account.")
+    session = await _auth_request(
+        "POST",
+        "token?grant_type=password",
+        payload={"email": body.email, "password": body.password},
+    )
+    if not session.get("access_token"):
+        raise HTTPException(status_code=502, detail="Account created, but automatic sign-in failed. Please sign in normally.")
     return {
-        "created": bool(user.get("id")),
-        "confirmation_required": not session_created,
-        "message": (
-            "Account created. Check your email to confirm it."
-            if not session_created
-            else "Account created and signed in."
-        ),
-        "session": result if session_created else None,
+        "created": True,
+        "confirmation_required": False,
+        "message": "Account created and signed in. No confirmation code is needed.",
+        "session": session,
     }
 
 
