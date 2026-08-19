@@ -20,14 +20,14 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V13 Cloud"
-APP_VERSION = "13.2.2"
+APP_VERSION = "13.3.0"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -41,7 +41,12 @@ OPENAI_VOICE_DEEP_MODEL = os.getenv("OPENAI_VOICE_DEEP_MODEL", "gpt-5.6-terra").
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe").strip()
 OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "cedar").strip()
+OPENAI_WEB_MODEL = os.getenv("OPENAI_WEB_MODEL", OPENAI_USER_MODEL).strip()
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip()
+PAYPAL_CHECKOUT_URL = os.getenv("PAYPAL_CHECKOUT_URL", "").strip()
+SUPPORT_DISCORD = os.getenv("SUPPORT_DISCORD", "ljproshooter7229").strip()
+SUPPORT_INSTAGRAM = os.getenv("SUPPORT_INSTAGRAM", "").strip()
+SUPPORT_TELEGRAM = os.getenv("SUPPORT_TELEGRAM", "").strip()
 CLIENT_LATEST_VERSION = os.getenv("CLIENT_LATEST_VERSION", APP_VERSION).strip()
 CLIENT_UPDATE_URL = os.getenv("CLIENT_UPDATE_URL", "").strip()
 CLIENT_UPDATE_SHA256 = os.getenv("CLIENT_UPDATE_SHA256", "").strip().lower()
@@ -54,7 +59,7 @@ USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,24}$")
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 PLAN_LIMITS: dict[str, int | None] = {
-    "FREE": 5,
+    "FREE": 15,
     "PREMIUM": 100,
     "PREMIUM_PLUS": 250,
     "VIP": 1000,
@@ -62,6 +67,13 @@ PLAN_LIMITS: dict[str, int | None] = {
 }
 VOICE_PLANS = {"PREMIUM", "PREMIUM_PLUS", "VIP", "ADMIN"}
 CEDAR_PLANS = {"VIP", "ADMIN"}
+OPENAI_VOICES = {"alloy", "ash", "ballad", "cedar", "coral", "echo", "marin", "sage", "shimmer", "verse"}
+PLAN_PERIODS = {
+    "FREE": {"1_MONTH": 0.0, "3_MONTHS": 0.0, "12_MONTHS": 0.0},
+    "PREMIUM": {"1_MONTH": 10.0, "3_MONTHS": 30.0, "12_MONTHS": 108.0},
+    "PREMIUM_PLUS": {"1_MONTH": 25.0, "3_MONTHS": 75.0, "12_MONTHS": 270.0},
+    "VIP": {"1_MONTH": 100.0, "3_MONTHS": 300.0, "12_MONTHS": 1080.0},
+}
 
 
 def _configured() -> bool:
@@ -309,6 +321,32 @@ async def _load_profile(user_id: str) -> dict[str, Any]:
     return rows[0]
 
 
+async def _resolve_account_email(identifier: str) -> str:
+    """Accept either an email address or the public LJ AI username at sign-in."""
+    cleaned = identifier.strip()
+    if "@" in cleaned:
+        email = cleaned.lower()
+        if not EMAIL_PATTERN.match(email):
+            raise HTTPException(status_code=400, detail="Enter a valid email address.")
+        return email
+    if not USERNAME_PATTERN.match(cleaned):
+        raise HTTPException(status_code=400, detail="Enter a valid email address or username.")
+    rows = await _rest_request(
+        "GET",
+        "profiles",
+        params={"select": "username,email", "username": f"ilike.{cleaned}", "limit": "2"},
+    ) or []
+    match = next(
+        (row for row in rows if str(row.get("username") or "").casefold() == cleaned.casefold()),
+        None,
+    )
+    email = str((match or {}).get("email") or "").strip().lower()
+    if not email:
+        # Keep the response deliberately generic so usernames cannot be enumerated.
+        raise HTTPException(status_code=400, detail="The email/username or password is incorrect.")
+    return email
+
+
 async def _mark_seen(user_id: str) -> None:
     now = time.monotonic()
     if now - _seen_updates.get(user_id, 0.0) < 40:
@@ -392,8 +430,21 @@ class SignUpRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: str = Field(min_length=5, max_length=254)
+    identifier: str = Field(default="", max_length=254)
+    email: str = Field(default="", max_length=254)
     password: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def require_identifier(self) -> "LoginRequest":
+        value = (self.identifier or self.email).strip()
+        if len(value) < 3:
+            raise ValueError("Enter your email address or username.")
+        self.identifier = value
+        return self
+
+
+class PasswordResetRequest(BaseModel):
+    identifier: str = Field(min_length=3, max_length=254)
 
 
 class RefreshRequest(BaseModel):
@@ -413,6 +464,8 @@ class ChatRequest(BaseModel):
     bot_name: str = Field(default="LJ AI", min_length=1, max_length=30)
     memory: list[str] = Field(default_factory=list, max_length=50)
     from_voice: bool = False
+    reply_mode: Literal["FAST", "NORMAL", "THOUGHTFUL"] = "FAST"
+    web_enabled: bool = True
 
     @field_validator("message")
     @classmethod
@@ -426,6 +479,16 @@ class ChatRequest(BaseModel):
 class SpeechRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
     speed: Literal["SLOW", "NORMAL", "FAST"] = "NORMAL"
+    voice: str = Field(default="cedar", min_length=2, max_length=30)
+    response_format: Literal["MP3", "PCM"] = "MP3"
+
+    @field_validator("voice")
+    @classmethod
+    def validate_voice(cls, value: str) -> str:
+        cleaned = value.strip().casefold()
+        if cleaned not in OPENAI_VOICES:
+            raise ValueError("Choose a supported LJ AI voice.")
+        return cleaned
 
 
 class ScreenRequest(BaseModel):
@@ -570,11 +633,17 @@ async def signup(body: SignUpRequest, request: Request) -> dict[str, Any]:
 async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
     client_ip = request.client.host if request.client else "unknown"
     await limiter.enforce(f"login:{client_ip}", 12, 300)
-    result = await _auth_request(
-        "POST",
-        "token?grant_type=password",
-        payload={"email": body.email.strip().lower(), "password": body.password},
-    )
+    try:
+        email = await _resolve_account_email(body.identifier or body.email)
+        result = await _auth_request(
+            "POST",
+            "token?grant_type=password",
+            payload={"email": email, "password": body.password},
+        )
+    except HTTPException as error:
+        if error.status_code in {400, 401, 403}:
+            raise HTTPException(status_code=400, detail="The email/username or password is incorrect.") from None
+        raise
     user = result.get("user") or {}
     user_id = str(user.get("id") or "")
     if user_id:
@@ -584,6 +653,26 @@ async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
             pass
         await _insert_audit(user_id, "LOGIN", {"source": "desktop_app"})
     return result
+
+
+@app.post("/v1/auth/password-reset")
+async def password_reset(body: PasswordResetRequest, request: Request) -> dict[str, str]:
+    client_ip = request.client.host if request.client else "unknown"
+    await limiter.enforce(f"password-reset:{client_ip}", 5, 3600)
+    try:
+        email = await _resolve_account_email(body.identifier)
+        await _auth_request("POST", "recover", payload={"email": email})
+    except HTTPException as error:
+        if error.status_code >= 500:
+            raise
+        # Account recovery must never reveal whether a username/email exists.
+        pass
+    return {
+        "message": (
+            "If that LJ AI account exists, Supabase has sent its secure password-reset email. "
+            "The owner never sees your old or new password."
+        )
+    }
 
 
 @app.post("/v1/auth/refresh")
@@ -651,7 +740,18 @@ async def plans() -> Any:
             "order": "sort_order.asc",
         },
     )
-    return rows or []
+    catalog = rows or []
+    for row in catalog:
+        key = str(row.get("plan_key") or "FREE").upper()
+        row["billing_periods_usd"] = PLAN_PERIODS.get(key, {})
+        row["annual_discount_percent"] = 10 if key != "FREE" else 0
+        row["checkout_url"] = PAYPAL_CHECKOUT_URL if PAYPAL_CHECKOUT_URL.startswith("https://") else ""
+        row["support"] = {
+            "discord": SUPPORT_DISCORD,
+            "instagram": SUPPORT_INSTAGRAM,
+            "telegram": SUPPORT_TELEGRAM,
+        }
+    return catalog
 
 
 def _jarvis_instructions(
@@ -781,6 +881,19 @@ def _voice_needs_deeper_reasoning(message: str, detail: str) -> bool:
     return any(phrase in text for phrase in deeper_phrases)
 
 
+def _needs_web_access(message: str) -> bool:
+    text = message.casefold()
+    if re.search(r"https?://[^\s]+", message):
+        return True
+    return any(
+        phrase in text
+        for phrase in (
+            "look this up", "search the web", "search online", "current price", "latest price",
+            "menu and prices", "restaurant menu", "tell me about this link", "what is on this website",
+        )
+    )
+
+
 @app.post("/v1/chat")
 async def chat(
     body: ChatRequest,
@@ -801,11 +914,17 @@ async def chat(
         )
 
     model = OPENAI_ADMIN_MODEL if identity.role == "ADMIN" else OPENAI_USER_MODEL
-    deep_voice_request = body.from_voice and _voice_needs_deeper_reasoning(body.message, body.detail)
+    deep_voice_request = body.from_voice and (
+        body.reply_mode == "THOUGHTFUL" or _voice_needs_deeper_reasoning(body.message, body.detail)
+    )
     if body.from_voice:
         model = OPENAI_VOICE_DEEP_MODEL if deep_voice_request else OPENAI_VOICE_REPLY_MODEL
-        max_output_tokens = {"CONCISE": 220, "BALANCED": 360, "DETAILED": 700}[body.detail]
-        history_turns = 12 if deep_voice_request else 8
+        max_output_tokens = {
+            "FAST": {"CONCISE": 160, "BALANCED": 260, "DETAILED": 420},
+            "NORMAL": {"CONCISE": 220, "BALANCED": 360, "DETAILED": 700},
+            "THOUGHTFUL": {"CONCISE": 320, "BALANCED": 650, "DETAILED": 1100},
+        }[body.reply_mode][body.detail]
+        history_turns = MAX_HISTORY_TURNS if body.reply_mode != "FAST" else 14
     else:
         max_output_tokens = {"CONCISE": 500, "BALANCED": 1000, "DETAILED": 1600}[body.detail]
         history_turns = MAX_HISTORY_TURNS
@@ -822,6 +941,14 @@ async def chat(
         payload["reasoning"] = {"effort": "medium" if deep_voice_request else "low"}
     elif OPENAI_REASONING_EFFORT:
         payload["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
+
+    if body.web_enabled and _needs_web_access(body.message):
+        payload["model"] = OPENAI_WEB_MODEL if identity.role != "ADMIN" else OPENAI_ADMIN_MODEL
+        payload["tools"] = [{"type": "web_search"}]
+        payload["instructions"] += (
+            "\nThe user explicitly requested current public web information or supplied a public link. "
+            "Use web search, state when a page blocks access, and never access private/local addresses or authenticated accounts."
+        )
 
     data = await _openai_json("responses", payload)
     reply = _extract_response_text(data)
@@ -926,6 +1053,7 @@ async def analyze_screen(
 async def transcribe(
     request: Request,
     audio: UploadFile = File(...),
+    context: str = Form(default=""),
     identity: Identity = Depends(current_identity),
 ) -> dict[str, str]:
     if identity.effective_plan not in VOICE_PLANS:
@@ -954,7 +1082,9 @@ async def transcribe(
         "response_format": "json",
         "prompt": (
             "Australian English. Likely names and terms include LJ AI, LJ Tool, Cedar, "
-            "OpenAI, OctoVPN, OpenVPN, VPN, Mudgee and sir."
+            "OpenAI, OctoVPN, OpenVPN, OpenVPN Connect, VPN, Mudgee and sir. "
+            "Preserve the speaker's intended wording and punctuation. Recent conversation wording: "
+            + " ".join(context.split())[-700:]
         ),
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
@@ -997,7 +1127,7 @@ async def speech(
     identity: Identity = Depends(current_identity),
 ) -> StreamingResponse:
     if identity.effective_plan not in CEDAR_PLANS:
-        raise HTTPException(status_code=403, detail="Cedar voice requires VIP or Administrator access.")
+        raise HTTPException(status_code=403, detail="OpenAI voices require VIP or Administrator access.")
     await limiter.enforce(f"speech:{identity.user_id}", 40, 60)
     client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS)
     request = client.build_request(
@@ -1006,10 +1136,10 @@ async def speech(
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
         json={
             "model": OPENAI_TTS_MODEL,
-            "voice": OPENAI_TTS_VOICE,
+            "voice": body.voice or OPENAI_TTS_VOICE,
             "input": body.text.strip(),
             "instructions": _cedar_instructions(body.speed),
-            "response_format": "mp3",
+            "response_format": "pcm" if body.response_format == "PCM" else "mp3",
         },
     )
     try:
@@ -1041,8 +1171,14 @@ async def speech(
 
     return StreamingResponse(
         audio_stream(),
-        media_type="audio/mpeg",
-        headers={"Content-Disposition": "inline; filename=jarvis-cedar.mp3"},
+        media_type="audio/pcm" if body.response_format == "PCM" else "audio/mpeg",
+        headers={
+            "Content-Disposition": (
+                "inline; filename=lj-ai-voice.pcm"
+                if body.response_format == "PCM"
+                else "inline; filename=lj-ai-voice.mp3"
+            )
+        },
     )
 
 
@@ -1294,3 +1430,30 @@ async def admin_chat_logs(identity: Identity = Depends(current_identity)) -> Any
             "limit": "500",
         },
     )
+
+
+@app.get("/v1/admin/subscriptions")
+async def admin_subscriptions(identity: Identity = Depends(current_identity)) -> list[dict[str, Any]]:
+    require_admin(identity)
+    rows = await _rest_request(
+        "GET",
+        "profiles",
+        params={
+            "role": "eq.USER",
+            "plan": "neq.FREE",
+            "select": "id,username,email,plan,plan_expires_at,account_status,created_at",
+            "order": "plan_expires_at.asc.nullslast",
+            "limit": "1000",
+        },
+    ) or []
+    now = datetime.now(timezone.utc)
+    active: list[dict[str, Any]] = []
+    for row in rows:
+        expiry = _parse_timestamp(row.get("plan_expires_at"))
+        if row.get("account_status") != "ACTIVE" or expiry is None or expiry <= now:
+            continue
+        remaining = expiry - now
+        row["seconds_remaining"] = max(0, int(remaining.total_seconds()))
+        row["days_remaining"] = max(0, remaining.days)
+        active.append(row)
+    return active

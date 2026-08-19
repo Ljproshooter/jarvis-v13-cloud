@@ -32,5 +32,17 @@ services:
         value: gpt-4o-mini-tts
       - key: OPENAI_TTS_VOICE
         value: cedar
+      - key: OPENAI_WEB_MODEL
+        value: gpt-5-mini
       - key: OPENAI_REASONING_EFFORT
         value: low
+      - key: PAYPAL_CHECKOUT_URL
+        sync: false
+      - key: SUPPORT_DISCORD
+        value: ljproshooter7229
+      - key: SUPPORT_INSTAGRAM
+        sync: false
+      - key: SUPPORT_TELEGRAM
+        sync: false
+      - key: CLIENT_LATEST_VERSION
+        value: 13.3.0
