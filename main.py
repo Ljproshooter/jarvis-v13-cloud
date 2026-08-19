@@ -20,14 +20,14 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V13 Cloud"
-APP_VERSION = "13.3.0"
+APP_VERSION = "13.3.2"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -43,6 +43,9 @@ OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "cedar").strip()
 OPENAI_WEB_MODEL = os.getenv("OPENAI_WEB_MODEL", OPENAI_USER_MODEL).strip()
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip()
+OPENAI_VOICE_SERVICE_TIER = os.getenv("OPENAI_VOICE_SERVICE_TIER", "default").strip().casefold()
+if OPENAI_VOICE_SERVICE_TIER not in {"default", "fast"}:
+    OPENAI_VOICE_SERVICE_TIER = "default"
 PAYPAL_CHECKOUT_URL = os.getenv("PAYPAL_CHECKOUT_URL", "").strip()
 SUPPORT_DISCORD = os.getenv("SUPPORT_DISCORD", "ljproshooter7229").strip()
 SUPPORT_INSTAGRAM = os.getenv("SUPPORT_INSTAGRAM", "").strip()
@@ -74,6 +77,19 @@ PLAN_PERIODS = {
     "PREMIUM_PLUS": {"1_MONTH": 25.0, "3_MONTHS": 75.0, "12_MONTHS": 270.0},
     "VIP": {"1_MONTH": 100.0, "3_MONTHS": 300.0, "12_MONTHS": 1080.0},
 }
+
+_SHARED_HTTP_CLIENT: httpx.AsyncClient | None = None
+
+
+def _shared_http_client() -> httpx.AsyncClient:
+    """Reuse HTTPS connections so every API stage avoids a new TLS handshake."""
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is None or _SHARED_HTTP_CLIENT.is_closed:
+        _SHARED_HTTP_CLIENT = httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=45),
+        )
+    return _SHARED_HTTP_CLIENT
 
 
 def _configured() -> bool:
@@ -153,16 +169,16 @@ async def _auth_request(
     access_token: str | None = None,
 ) -> dict[str, Any]:
     _require_configuration()
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        try:
-            response = await client.request(
-                method,
-                f"{SUPABASE_URL}/auth/v1/{path.lstrip('/')}",
-                headers=_public_auth_headers(access_token),
-                json=payload,
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=503, detail="Authentication service is unavailable.") from exc
+    client = _shared_http_client()
+    try:
+        response = await client.request(
+            method,
+            f"{SUPABASE_URL}/auth/v1/{path.lstrip('/')}",
+            headers=_public_auth_headers(access_token),
+            json=payload,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail="Authentication service is unavailable.") from exc
     if response.status_code >= 400:
         raise HTTPException(
             status_code=response.status_code if response.status_code < 500 else 502,
@@ -181,16 +197,16 @@ async def _auth_admin_request(
 ) -> dict[str, Any]:
     """Call a Supabase Auth admin endpoint using only the server-side secret."""
     _require_configuration()
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        try:
-            response = await client.request(
-                method,
-                f"{SUPABASE_URL}/auth/v1/{path.lstrip('/')}",
-                headers=_service_headers(),
-                json=payload,
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=503, detail="Authentication service is unavailable.") from exc
+    client = _shared_http_client()
+    try:
+        response = await client.request(
+            method,
+            f"{SUPABASE_URL}/auth/v1/{path.lstrip('/')}",
+            headers=_service_headers(),
+            json=payload,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail="Authentication service is unavailable.") from exc
     if response.status_code >= 400:
         raise HTTPException(
             status_code=response.status_code if response.status_code < 500 else 502,
@@ -210,17 +226,17 @@ async def _rest_request(
     prefer: str | None = None,
 ) -> Any:
     _require_configuration()
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        try:
-            response = await client.request(
-                method,
-                f"{SUPABASE_URL}/rest/v1/{table}",
-                headers=_service_headers(prefer),
-                params=params,
-                json=payload,
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=503, detail="Database service is unavailable.") from exc
+    client = _shared_http_client()
+    try:
+        response = await client.request(
+            method,
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_service_headers(prefer),
+            params=params,
+            json=payload,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail="Database service is unavailable.") from exc
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail="Database request failed.")
     if not response.content:
@@ -800,15 +816,15 @@ def _extract_response_text(data: dict[str, Any]) -> str:
 async def _openai_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     _require_configuration()
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        try:
-            response = await client.post(
-                f"https://api.openai.com/v1/{path.lstrip('/')}",
-                headers=headers,
-                json=payload,
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=503, detail="The AI service is currently unreachable.") from exc
+    client = _shared_http_client()
+    try:
+        response = await client.post(
+            f"https://api.openai.com/v1/{path.lstrip('/')}",
+            headers=headers,
+            json=payload,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail="The AI service is currently unreachable.") from exc
     if response.status_code >= 400:
         message = _safe_upstream_message(response, "The AI service could not complete the request.")
         if response.status_code == 429:
@@ -868,6 +884,34 @@ async def _save_chat_log(
         pass
 
 
+async def _record_completed_chat(
+    identity: Identity,
+    prompt: str,
+    reply: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    from_voice: bool,
+) -> None:
+    """Record usage and logs after replying instead of delaying the user."""
+    await asyncio.gather(
+        _record_api_usage(
+            identity.user_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        ),
+        _save_chat_log(
+            identity,
+            prompt,
+            reply,
+            model,
+            input_tokens,
+            output_tokens,
+            from_voice,
+        ),
+    )
+
+
 def _voice_needs_deeper_reasoning(message: str, detail: str) -> bool:
     """Keep ordinary speech quick while preserving extra thought for complex requests."""
     text = " ".join(message.casefold().split())
@@ -898,6 +942,7 @@ def _needs_web_access(message: str) -> bool:
 async def chat(
     body: ChatRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     identity: Identity = Depends(current_identity),
 ) -> dict[str, Any]:
     await limiter.enforce(f"chat:{identity.user_id}", 30, 60)
@@ -920,11 +965,11 @@ async def chat(
     if body.from_voice:
         model = OPENAI_VOICE_DEEP_MODEL if deep_voice_request else OPENAI_VOICE_REPLY_MODEL
         max_output_tokens = {
-            "FAST": {"CONCISE": 160, "BALANCED": 260, "DETAILED": 420},
-            "NORMAL": {"CONCISE": 220, "BALANCED": 360, "DETAILED": 700},
+            "FAST": {"CONCISE": 120, "BALANCED": 180, "DETAILED": 300},
+            "NORMAL": {"CONCISE": 180, "BALANCED": 300, "DETAILED": 550},
             "THOUGHTFUL": {"CONCISE": 320, "BALANCED": 650, "DETAILED": 1100},
         }[body.reply_mode][body.detail]
-        history_turns = MAX_HISTORY_TURNS if body.reply_mode != "FAST" else 14
+        history_turns = MAX_HISTORY_TURNS if body.reply_mode != "FAST" else 8
     else:
         max_output_tokens = {"CONCISE": 500, "BALANCED": 1000, "DETAILED": 1600}[body.detail]
         history_turns = MAX_HISTORY_TURNS
@@ -938,7 +983,11 @@ async def chat(
     }
     if body.from_voice:
         payload["text"] = {"verbosity": "medium" if deep_voice_request else "low"}
-        payload["reasoning"] = {"effort": "medium" if deep_voice_request else "low"}
+        payload["reasoning"] = {
+            "effort": "medium" if deep_voice_request else ("none" if body.reply_mode == "FAST" else "low")
+        }
+        if OPENAI_VOICE_SERVICE_TIER == "fast":
+            payload["service_tier"] = "fast"
     elif OPENAI_REASONING_EFFORT:
         payload["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
 
@@ -957,12 +1006,8 @@ async def chat(
     usage = data.get("usage") or {}
     input_tokens = int(usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or 0)
-    await _record_api_usage(
-        identity.user_id,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-    )
-    await _save_chat_log(
+    background_tasks.add_task(
+        _record_completed_chat,
         identity,
         body.message,
         reply,
@@ -1087,16 +1132,16 @@ async def transcribe(
             + " ".join(context.split())[-700:]
         ),
     }
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        try:
-            response = await client.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers=headers,
-                data=form,
-                files=files,
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=503, detail="Speech recognition is unavailable.") from exc
+    client = _shared_http_client()
+    try:
+        response = await client.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers=headers,
+            data=form,
+            files=files,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail="Speech recognition is unavailable.") from exc
     if response.status_code >= 400:
         raise HTTPException(
             status_code=502,
@@ -1124,6 +1169,7 @@ def _cedar_instructions(speed: str) -> str:
 @app.post("/v1/voice/speech")
 async def speech(
     body: SpeechRequest,
+    background_tasks: BackgroundTasks,
     identity: Identity = Depends(current_identity),
 ) -> StreamingResponse:
     if identity.effective_plan not in CEDAR_PLANS:
@@ -1158,7 +1204,11 @@ async def speech(
             message = "Cedar voice failed."
         raise HTTPException(status_code=502, detail=message[:300])
 
-    await _record_api_usage(identity.user_id, speech_characters=len(body.text))
+    background_tasks.add_task(
+        _record_api_usage,
+        identity.user_id,
+        speech_characters=len(body.text),
+    )
 
     async def audio_stream():
         try:
@@ -1172,6 +1222,7 @@ async def speech(
     return StreamingResponse(
         audio_stream(),
         media_type="audio/pcm" if body.response_format == "PCM" else "audio/mpeg",
+        background=background_tasks,
         headers={
             "Content-Disposition": (
                 "inline; filename=lj-ai-voice.pcm"

@@ -36,6 +36,8 @@ services:
         value: gpt-5-mini
       - key: OPENAI_REASONING_EFFORT
         value: low
+      - key: OPENAI_VOICE_SERVICE_TIER
+        value: default
       - key: PAYPAL_CHECKOUT_URL
         sync: false
       - key: SUPPORT_DISCORD
@@ -45,4 +47,4 @@ services:
       - key: SUPPORT_TELEGRAM
         sync: false
       - key: CLIENT_LATEST_VERSION
-        value: 13.3.0
+        value: 13.3.2
