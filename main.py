@@ -1,4 +1,4 @@
-"""LJ AI V14 Cloud API.
+"""LJ AI V14.1 Cloud API.
 
 All private credentials stay in Render environment variables. The distributed
 Windows client authenticates users here and never receives the OpenAI or
@@ -29,8 +29,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-APP_NAME = "LJ AI V14 Cloud"
-APP_VERSION = "14.0.0"
+APP_NAME = "LJ AI V14.1 Cloud"
+APP_VERSION = "14.1.0"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -1190,8 +1190,17 @@ async def chat(
     identity: Identity = Depends(current_identity),
 ) -> dict[str, Any]:
     await limiter.enforce(f"chat:{identity.user_id}", 30, 60)
-    allowance = await _rpc("consume_jarvis_message", {"p_user_id": identity.user_id})
-    allowance_row = allowance[0] if isinstance(allowance, list) and allowance else allowance or {}
+    # Administrator chat is unlimited. Avoid a database round-trip on every
+    # Admin voice turn so the compatibility pipeline can reach OpenAI sooner.
+    if identity.role == "ADMIN":
+        allowance_row: dict[str, Any] = {
+            "allowed": True,
+            "messages_used": 0,
+            "daily_limit": None,
+        }
+    else:
+        allowance = await _rpc("consume_jarvis_message", {"p_user_id": identity.user_id})
+        allowance_row = allowance[0] if isinstance(allowance, list) and allowance else allowance or {}
     if not allowance_row.get("allowed"):
         raise HTTPException(
             status_code=429,
@@ -1210,11 +1219,11 @@ async def chat(
     if body.from_voice:
         model = OPENAI_VOICE_DEEP_MODEL if deep_voice_request else OPENAI_VOICE_REPLY_MODEL
         max_output_tokens = {
-            "FAST": {"CONCISE": 120, "BALANCED": 180, "DETAILED": 300},
-            "NORMAL": {"CONCISE": 180, "BALANCED": 300, "DETAILED": 550},
+            "FAST": {"CONCISE": 80, "BALANCED": 120, "DETAILED": 220},
+            "NORMAL": {"CONCISE": 120, "BALANCED": 220, "DETAILED": 400},
             "THOUGHTFUL": {"CONCISE": 320, "BALANCED": 650, "DETAILED": 1100},
         }[body.reply_mode][body.detail]
-        history_turns = MAX_HISTORY_TURNS if body.reply_mode != "FAST" else 8
+        history_turns = MAX_HISTORY_TURNS if body.reply_mode != "FAST" else 6
     else:
         if body.reply_mode == "FAST" and not web_request:
             model = OPENAI_TEXT_FAST_MODEL
@@ -1232,6 +1241,10 @@ async def chat(
         "max_output_tokens": max_output_tokens,
     }
     if body.from_voice:
+        payload["instructions"] += (
+            "\nThis is a latency-sensitive spoken turn. Start with the answer, skip filler, "
+            "and normally use one to three short sentences unless the user asks for detail."
+        )
         payload["text"] = {"verbosity": "medium" if deep_voice_request else "low"}
         payload["reasoning"] = {
             "effort": "medium" if deep_voice_request else ("none" if body.reply_mode == "FAST" else "low")
@@ -1333,7 +1346,11 @@ async def realtime_token(
     """Mint a short-lived Realtime token; the permanent OpenAI key stays on Render."""
     if identity.effective_plan not in CEDAR_PLANS:
         raise HTTPException(status_code=403, detail="Realtime OpenAI voice requires VIP or Administrator access.")
-    await limiter.enforce(f"realtime-token:{identity.user_id}", 8, 3600)
+    # Starting and stopping the voice screen during setup used to exhaust an
+    # eight-per-hour allowance and silently force the Windows client back to
+    # the slower compatibility pipeline.  Keep an abuse guard, but allow
+    # normal reconnects and testing.
+    await limiter.enforce(f"realtime-token:{identity.user_id}", 120, 3600)
     requested_voice = body.voice.casefold()
     voice = requested_voice if requested_voice in OPENAI_VOICES else OPENAI_REALTIME_VOICE
     bot_name = body.bot_name.strip() if identity.effective_plan in {"VIP", "ADMIN"} else "LJ AI"
@@ -1420,8 +1437,10 @@ Do not bypass Windows security, execute arbitrary command strings, make purchase
                     "prompt": "Australian English. Names include LJ AI, LEXI, Jarvis, Cedar, Mudgee, OctoVPN and OpenVPN.",
                 },
                 "turn_detection": {
-                    "type": "semantic_vad",
-                    "eagerness": "high",
+                    "type": "server_vad",
+                    "threshold": 0.55,
+                    "prefix_padding_ms": 250,
+                    "silence_duration_ms": 450,
                     "create_response": True,
                     "interrupt_response": True,
                 },
