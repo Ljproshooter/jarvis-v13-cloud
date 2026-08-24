@@ -33,11 +33,19 @@ services:
       - key: OPENAI_TTS_VOICE
         value: cedar
       - key: OPENAI_WEB_MODEL
-        value: gpt-5-mini
+        value: gpt-5.6-luna
+      - key: OPENAI_TEXT_FAST_MODEL
+        value: gpt-5.6-luna
+      - key: OPENAI_TEXT_SERVICE_TIER
+        value: fast
       - key: OPENAI_REASONING_EFFORT
         value: low
       - key: OPENAI_VOICE_SERVICE_TIER
-        value: default
+        value: fast
+      - key: OPENAI_REALTIME_MODEL
+        value: gpt-realtime-2.1
+      - key: OPENAI_REALTIME_VOICE
+        value: cedar
       - key: PAYPAL_CHECKOUT_URL
         sync: false
       - key: SUPPORT_DISCORD
@@ -47,4 +55,4 @@ services:
       - key: SUPPORT_TELEGRAM
         sync: false
       - key: CLIENT_LATEST_VERSION
-        value: 13.3.2
+        value: 14.0.0

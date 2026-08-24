@@ -1,4 +1,4 @@
-"""LJ AI V13 Cloud API.
+"""LJ AI V14 Cloud API.
 
 All private credentials stay in Render environment variables. The distributed
 Windows client authenticates users here and never receives the OpenAI or
@@ -10,10 +10,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import time
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -26,8 +29,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-APP_NAME = "LJ AI V13 Cloud"
-APP_VERSION = "13.3.2"
+APP_NAME = "LJ AI V14 Cloud"
+APP_VERSION = "14.0.0"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -42,10 +45,16 @@ OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcrib
 OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "cedar").strip()
 OPENAI_WEB_MODEL = os.getenv("OPENAI_WEB_MODEL", OPENAI_USER_MODEL).strip()
+OPENAI_TEXT_FAST_MODEL = os.getenv("OPENAI_TEXT_FAST_MODEL", OPENAI_VOICE_REPLY_MODEL).strip()
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip()
-OPENAI_VOICE_SERVICE_TIER = os.getenv("OPENAI_VOICE_SERVICE_TIER", "default").strip().casefold()
+OPENAI_VOICE_SERVICE_TIER = os.getenv("OPENAI_VOICE_SERVICE_TIER", "fast").strip().casefold()
 if OPENAI_VOICE_SERVICE_TIER not in {"default", "fast"}:
     OPENAI_VOICE_SERVICE_TIER = "default"
+OPENAI_TEXT_SERVICE_TIER = os.getenv("OPENAI_TEXT_SERVICE_TIER", "fast").strip().casefold()
+if OPENAI_TEXT_SERVICE_TIER not in {"default", "fast"}:
+    OPENAI_TEXT_SERVICE_TIER = "default"
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1").strip()
+OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "cedar").strip().casefold()
 PAYPAL_CHECKOUT_URL = os.getenv("PAYPAL_CHECKOUT_URL", "").strip()
 SUPPORT_DISCORD = os.getenv("SUPPORT_DISCORD", "ljproshooter7229").strip()
 SUPPORT_INSTAGRAM = os.getenv("SUPPORT_INSTAGRAM", "").strip()
@@ -71,6 +80,8 @@ PLAN_LIMITS: dict[str, int | None] = {
 VOICE_PLANS = {"PREMIUM", "PREMIUM_PLUS", "VIP", "ADMIN"}
 CEDAR_PLANS = {"VIP", "ADMIN"}
 OPENAI_VOICES = {"alloy", "ash", "ballad", "cedar", "coral", "echo", "marin", "sage", "shimmer", "verse"}
+if OPENAI_REALTIME_VOICE not in OPENAI_VOICES:
+    OPENAI_REALTIME_VOICE = "cedar"
 PLAN_PERIODS = {
     "FREE": {"1_MONTH": 0.0, "3_MONTHS": 0.0, "12_MONTHS": 0.0},
     "PREMIUM": {"1_MONTH": 10.0, "3_MONTHS": 30.0, "12_MONTHS": 108.0},
@@ -363,6 +374,93 @@ async def _resolve_account_email(identifier: str) -> str:
     return email
 
 
+async def _profile_for_identifier(identifier: str) -> dict[str, Any] | None:
+    """Resolve an account for owner-assisted recovery without exposing it publicly."""
+    cleaned = identifier.strip()
+    if "@" in cleaned:
+        if not EMAIL_PATTERN.match(cleaned.lower()):
+            return None
+        field, value = "email", cleaned.lower()
+    else:
+        if not USERNAME_PATTERN.match(cleaned):
+            return None
+        field, value = "username", cleaned
+    rows = await _rest_request(
+        "GET",
+        "profiles",
+        params={
+            "select": "id,username,email,account_status",
+            field: f"ilike.{value}",
+            "limit": "2",
+        },
+    ) or []
+    return next(
+        (
+            row for row in rows
+            if str(row.get(field) or "").casefold() == value.casefold()
+        ),
+        None,
+    )
+
+
+def _recovery_secret_hash(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+async def _recovery_request_with_secret(request_id: str, secret: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", request_id) or len(secret) < 20:
+        raise HTTPException(status_code=404, detail="Recovery request not found.")
+    rows = await _rest_request(
+        "GET",
+        "password_recovery_requests",
+        params={
+            "id": f"eq.{request_id}",
+            "select": "id,user_id,username,email,status,secret_hash,created_at,updated_at,expires_at,approved_at,completed_at",
+            "limit": "1",
+        },
+    ) or []
+    if not rows or not hmac.compare_digest(
+        str(rows[0].get("secret_hash") or ""), _recovery_secret_hash(secret)
+    ):
+        raise HTTPException(status_code=404, detail="Recovery request not found.")
+    item = rows[0]
+    expiry = _parse_timestamp(item.get("expires_at"))
+    if expiry is not None and expiry <= datetime.now(timezone.utc) and item.get("status") not in {"COMPLETED", "DENIED"}:
+        await _rest_request(
+            "PATCH",
+            "password_recovery_requests",
+            params={"id": f"eq.{request_id}"},
+            payload={"status": "EXPIRED", "updated_at": datetime.now(timezone.utc).isoformat()},
+            prefer="return=minimal",
+        )
+        item["status"] = "EXPIRED"
+    return item
+
+
+async def _recovery_public_view(item: dict[str, Any]) -> dict[str, Any]:
+    messages = await _rest_request(
+        "GET",
+        "password_recovery_messages",
+        params={
+            "request_id": f"eq.{item['id']}",
+            "select": "id,sender,message,created_at",
+            "order": "created_at.asc",
+            "limit": "100",
+        },
+    ) or []
+    return {
+        "id": item["id"],
+        "status": item.get("status"),
+        "username": item.get("username"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "expires_at": item.get("expires_at"),
+        "approved_at": item.get("approved_at"),
+        "completed_at": item.get("completed_at"),
+        "messages": messages,
+    }
+
+
 async def _mark_seen(user_id: str) -> None:
     now = time.monotonic()
     if now - _seen_updates.get(user_id, 0.0) < 40:
@@ -463,6 +561,26 @@ class PasswordResetRequest(BaseModel):
     identifier: str = Field(min_length=3, max_length=254)
 
 
+class RecoveryCreateRequest(BaseModel):
+    identifier: str = Field(min_length=3, max_length=254)
+    message: str = Field(default="I need help recovering my LJ AI account.", min_length=1, max_length=1500)
+
+
+class RecoveryMessageRequest(BaseModel):
+    secret: str = Field(min_length=20, max_length=300)
+    message: str = Field(min_length=1, max_length=1500)
+
+
+class RecoveryCompleteRequest(BaseModel):
+    secret: str = Field(min_length=20, max_length=300)
+    new_password: str = Field(min_length=10, max_length=128)
+
+
+class AdminRecoveryActionRequest(BaseModel):
+    action: Literal["APPROVE", "DENY", "REPLY"]
+    reply: str = Field(default="", max_length=1500)
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str = Field(min_length=20, max_length=4096)
 
@@ -490,6 +608,19 @@ class ChatRequest(BaseModel):
         if not cleaned:
             raise ValueError("Message cannot be empty.")
         return cleaned
+
+
+class WebLookupRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=1200)
+    context: str = Field(default="", max_length=1200)
+
+
+class RealtimeTokenRequest(BaseModel):
+    bot_name: str = Field(default="LJ AI", min_length=1, max_length=30)
+    personality: Literal["ADAPTIVE", "COMPOSED", "WARM", "SASSY", "SERIOUS"] = "ADAPTIVE"
+    permission_mode: Literal["SAFE", "FULL ACCESS"] = "SAFE"
+    weather_location: str = Field(default="Mudgee, NSW", min_length=2, max_length=120)
+    voice: str = Field(default="cedar", min_length=2, max_length=30)
 
 
 class SpeechRequest(BaseModel):
@@ -671,24 +802,129 @@ async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
     return result
 
 
-@app.post("/v1/auth/password-reset")
-async def password_reset(body: PasswordResetRequest, request: Request) -> dict[str, str]:
-    client_ip = request.client.host if request.client else "unknown"
-    await limiter.enforce(f"password-reset:{client_ip}", 5, 3600)
-    try:
-        email = await _resolve_account_email(body.identifier)
-        await _auth_request("POST", "recover", payload={"email": email})
-    except HTTPException as error:
-        if error.status_code >= 500:
-            raise
-        # Account recovery must never reveal whether a username/email exists.
-        pass
+async def _create_owner_recovery(identifier: str, message: str, client_ip: str) -> dict[str, Any]:
+    await limiter.enforce(f"owner-recovery:{client_ip}", 5, 3600)
+    profile = await _profile_for_identifier(identifier)
+    # Keep the public response generic so this endpoint cannot be used to list accounts.
+    if not profile or str(profile.get("account_status") or "") != "ACTIVE":
+        return {
+            "created": False,
+            "message": "If that account exists, a private recovery request is now available to the LJ AI owner.",
+        }
+    secret = secrets.token_urlsafe(36)
+    request_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(hours=48)
+    await _rest_request(
+        "POST",
+        "password_recovery_requests",
+        payload={
+            "id": request_id,
+            "user_id": profile["id"],
+            "username": str(profile.get("username") or "user"),
+            "email": str(profile.get("email") or ""),
+            "status": "OPEN",
+            "secret_hash": _recovery_secret_hash(secret),
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "expires_at": expires.isoformat(),
+        },
+        prefer="return=minimal",
+    )
+    await _rest_request(
+        "POST",
+        "password_recovery_messages",
+        payload={"request_id": request_id, "sender": "USER", "message": message.strip()},
+        prefer="return=minimal",
+    )
+    await _insert_audit(str(profile["id"]), "RECOVERY_REQUESTED", {"request_id": request_id})
     return {
-        "message": (
-            "If that LJ AI account exists, Supabase has sent its secure password-reset email. "
-            "The owner never sees your old or new password."
-        )
+        "created": True,
+        "request_id": request_id,
+        "secret": secret,
+        "expires_at": expires.isoformat(),
+        "message": "Your private account-recovery chat was sent to the LJ AI administrator.",
     }
+
+
+@app.post("/v1/auth/password-reset")
+async def password_reset(body: PasswordResetRequest, request: Request) -> dict[str, Any]:
+    """Compatibility route: owner-assisted recovery replaces email reset."""
+    client_ip = request.client.host if request.client else "unknown"
+    return await _create_owner_recovery(
+        body.identifier,
+        "I need help recovering my LJ AI account.",
+        client_ip,
+    )
+
+
+@app.post("/v1/auth/recovery-requests", status_code=201)
+async def create_recovery_request(body: RecoveryCreateRequest, request: Request) -> dict[str, Any]:
+    client_ip = request.client.host if request.client else "unknown"
+    return await _create_owner_recovery(body.identifier, body.message, client_ip)
+
+
+@app.get("/v1/auth/recovery-requests/{request_id}")
+async def recovery_request_status(request_id: str, secret: str, request: Request) -> dict[str, Any]:
+    client_ip = request.client.host if request.client else "unknown"
+    await limiter.enforce(f"owner-recovery-status:{client_ip}", 30, 300)
+    item = await _recovery_request_with_secret(request_id, secret)
+    return await _recovery_public_view(item)
+
+
+@app.post("/v1/auth/recovery-requests/{request_id}/messages", status_code=201)
+async def recovery_request_message(
+    request_id: str,
+    body: RecoveryMessageRequest,
+    request: Request,
+) -> dict[str, Any]:
+    client_ip = request.client.host if request.client else "unknown"
+    await limiter.enforce(f"owner-recovery-message:{client_ip}", 12, 300)
+    item = await _recovery_request_with_secret(request_id, body.secret)
+    if item.get("status") not in {"OPEN", "APPROVED"}:
+        raise HTTPException(status_code=409, detail="This recovery chat is no longer open.")
+    await _rest_request(
+        "POST",
+        "password_recovery_messages",
+        payload={"request_id": request_id, "sender": "USER", "message": body.message.strip()},
+        prefer="return=minimal",
+    )
+    await _rest_request(
+        "PATCH",
+        "password_recovery_requests",
+        params={"id": f"eq.{request_id}"},
+        payload={"updated_at": datetime.now(timezone.utc).isoformat()},
+        prefer="return=minimal",
+    )
+    return await _recovery_public_view(item)
+
+
+@app.post("/v1/auth/recovery-requests/{request_id}/complete")
+async def complete_recovery_request(
+    request_id: str,
+    body: RecoveryCompleteRequest,
+    request: Request,
+) -> dict[str, str]:
+    client_ip = request.client.host if request.client else "unknown"
+    await limiter.enforce(f"owner-recovery-complete:{client_ip}", 5, 3600)
+    item = await _recovery_request_with_secret(request_id, body.secret)
+    if item.get("status") != "APPROVED":
+        raise HTTPException(status_code=409, detail="The administrator has not approved this reset yet.")
+    await _auth_admin_request(
+        "PUT",
+        f"admin/users/{item['user_id']}",
+        payload={"password": body.new_password},
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    await _rest_request(
+        "PATCH",
+        "password_recovery_requests",
+        params={"id": f"eq.{request_id}"},
+        payload={"status": "COMPLETED", "completed_at": now, "updated_at": now},
+        prefer="return=minimal",
+    )
+    await _insert_audit(str(item["user_id"]), "RECOVERY_COMPLETED", {"request_id": request_id})
+    return {"message": "Password changed. You can now sign in with the new password."}
 
 
 @app.post("/v1/auth/refresh")
@@ -926,16 +1162,24 @@ def _voice_needs_deeper_reasoning(message: str, detail: str) -> bool:
 
 
 def _needs_web_access(message: str) -> bool:
-    text = message.casefold()
+    text = " ".join(message.casefold().split())
     if re.search(r"https?://[^\s]+", message):
         return True
+    web_words = {
+        "weather", "forecast", "restaurant", "restaurants", "menu", "menus", "price", "prices",
+        "opening", "hours", "address", "directions", "nearby", "news", "latest", "current",
+        "website", "web", "google", "search", "online", "today", "tomorrow", "week",
+    }
+    words = set(re.findall(r"[a-z0-9']+", text))
     return any(
         phrase in text
         for phrase in (
             "look this up", "search the web", "search online", "current price", "latest price",
             "menu and prices", "restaurant menu", "tell me about this link", "what is on this website",
+            "weather this week", "weekly weather", "seven day forecast", "7 day forecast",
+            "what is the menu", "read out the menu", "opening hours", "how much is",
         )
-    )
+    ) or bool(words & web_words and words & {"find", "tell", "show", "read", "what", "when", "where", "search", "look", "check", "give"})
 
 
 @app.post("/v1/chat")
@@ -959,6 +1203,7 @@ async def chat(
         )
 
     model = OPENAI_ADMIN_MODEL if identity.role == "ADMIN" else OPENAI_USER_MODEL
+    web_request = body.web_enabled and _needs_web_access(body.message)
     deep_voice_request = body.from_voice and (
         body.reply_mode == "THOUGHTFUL" or _voice_needs_deeper_reasoning(body.message, body.detail)
     )
@@ -971,8 +1216,13 @@ async def chat(
         }[body.reply_mode][body.detail]
         history_turns = MAX_HISTORY_TURNS if body.reply_mode != "FAST" else 8
     else:
-        max_output_tokens = {"CONCISE": 500, "BALANCED": 1000, "DETAILED": 1600}[body.detail]
-        history_turns = MAX_HISTORY_TURNS
+        if body.reply_mode == "FAST" and not web_request:
+            model = OPENAI_TEXT_FAST_MODEL
+            max_output_tokens = {"CONCISE": 220, "BALANCED": 420, "DETAILED": 700}[body.detail]
+            history_turns = 10
+        else:
+            max_output_tokens = {"CONCISE": 500, "BALANCED": 1000, "DETAILED": 1600}[body.detail]
+            history_turns = MAX_HISTORY_TURNS
     conversation = [turn.model_dump() for turn in body.history[-history_turns:]]
     conversation.append({"role": "user", "content": body.message})
     payload: dict[str, Any] = {
@@ -988,15 +1238,27 @@ async def chat(
         }
         if OPENAI_VOICE_SERVICE_TIER == "fast":
             payload["service_tier"] = "fast"
+    elif body.reply_mode == "FAST" and not web_request:
+        payload["text"] = {"verbosity": "low"}
+        payload["reasoning"] = {"effort": "none"}
+        if OPENAI_TEXT_SERVICE_TIER == "fast":
+            payload["service_tier"] = "fast"
     elif OPENAI_REASONING_EFFORT:
         payload["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
 
-    if body.web_enabled and _needs_web_access(body.message):
-        payload["model"] = OPENAI_WEB_MODEL if identity.role != "ADMIN" else OPENAI_ADMIN_MODEL
+    if web_request:
+        model = OPENAI_WEB_MODEL
+        payload["model"] = model
         payload["tools"] = [{"type": "web_search"}]
+        payload["reasoning"] = {"effort": "none"}
+        payload["text"] = {"verbosity": "low" if body.reply_mode == "FAST" else "medium"}
+        if OPENAI_TEXT_SERVICE_TIER == "fast":
+            payload["service_tier"] = "fast"
         payload["instructions"] += (
             "\nThe user explicitly requested current public web information or supplied a public link. "
-            "Use web search, state when a page blocks access, and never access private/local addresses or authenticated accounts."
+            "Always use web search before answering. For weather, give the requested days and location. "
+            "For restaurants, read the current menu, prices, opening hours and address when available. "
+            "Keep voice answers easy to listen to and state when a page blocks access. Never access private/local addresses or authenticated accounts."
         )
 
     data = await _openai_json("responses", payload)
@@ -1022,6 +1284,177 @@ async def chat(
         "messages_used": allowance_row.get("messages_used"),
         "daily_limit": allowance_row.get("daily_limit"),
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }
+
+
+@app.post("/v1/tools/web-lookup")
+async def web_lookup(
+    body: WebLookupRequest,
+    background_tasks: BackgroundTasks,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    """Current public-web research for both text chat and Realtime voice tools."""
+    await limiter.enforce(f"web-lookup:{identity.user_id}", 20, 60)
+    payload: dict[str, Any] = {
+        "model": OPENAI_WEB_MODEL,
+        "instructions": (
+            "You are the public-web research tool for LJ AI. Search before answering. "
+            "Return a concise factual answer suitable for being spoken aloud. For a restaurant, include current menu items, "
+            "prices, address and opening hours when available. For weather, include every requested forecast day. "
+            "Never access authenticated pages, private/local network addresses, passwords or payment accounts."
+        ),
+        "input": body.query + (("\nUseful context: " + body.context) if body.context.strip() else ""),
+        "tools": [{"type": "web_search"}],
+        "reasoning": {"effort": "none"},
+        "text": {"verbosity": "low"},
+        "max_output_tokens": 900,
+    }
+    if OPENAI_TEXT_SERVICE_TIER == "fast":
+        payload["service_tier"] = "fast"
+    data = await _openai_json("responses", payload)
+    reply = _extract_response_text(data)
+    if not reply:
+        raise HTTPException(status_code=502, detail="The web lookup returned no readable result.")
+    usage = data.get("usage") or {}
+    background_tasks.add_task(
+        _record_api_usage,
+        identity.user_id,
+        input_tokens=int(usage.get("input_tokens") or 0),
+        output_tokens=int(usage.get("output_tokens") or 0),
+    )
+    return {"reply": reply, "model": OPENAI_WEB_MODEL}
+
+
+@app.post("/v1/realtime/token")
+async def realtime_token(
+    body: RealtimeTokenRequest,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    """Mint a short-lived Realtime token; the permanent OpenAI key stays on Render."""
+    if identity.effective_plan not in CEDAR_PLANS:
+        raise HTTPException(status_code=403, detail="Realtime OpenAI voice requires VIP or Administrator access.")
+    await limiter.enforce(f"realtime-token:{identity.user_id}", 8, 3600)
+    requested_voice = body.voice.casefold()
+    voice = requested_voice if requested_voice in OPENAI_VOICES else OPENAI_REALTIME_VOICE
+    bot_name = body.bot_name.strip() if identity.effective_plan in {"VIP", "ADMIN"} else "LJ AI"
+    full_access = body.permission_mode == "FULL ACCESS"
+    tools = [
+        {
+            "type": "function",
+            "name": "web_lookup",
+            "description": (
+                "Search current public web information. Use for restaurants, menus, prices, opening hours, weekly weather, "
+                "news, public links and any fact that may have changed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_weather_forecast",
+            "description": "Get a fast current or 1-to-7-day weather forecast for a named location.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "days": {"type": "integer", "minimum": 1, "maximum": 7},
+                },
+                "required": ["location", "days"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "type": "function",
+            "name": "open_public_website",
+            "description": "Open a normal public website or Google search only when the user directly asks to open or visit it.",
+            "parameters": {
+                "type": "object",
+                "properties": {"target": {"type": "string"}},
+                "required": ["target"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "type": "function",
+            "name": "open_windows_item",
+            "description": (
+                "Open an installed Windows app, ordinary file or folder only when directly requested. "
+                + ("Full Access is enabled for normal low-risk opening actions." if full_access else "Safe mode may limit local targets.")
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"target": {"type": "string"}},
+                "required": ["target"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+    instructions = f"""
+You are {bot_name}, LJ AI's live voice companion created by LJ. Address the user as sir naturally.
+Speak at a normal, confident, polished pace with a subtle futuristic quality. Respond promptly and usually in two to five sentences.
+Use Australian English. The default weather location is {body.weather_location}. The selected personality is {body.personality.lower()}.
+This is a live speech conversation: allow natural pauses, do not interrupt unnecessarily, and stop immediately when the user interrupts.
+Use get_weather_forecast for current, tomorrow or weekly weather. Use web_lookup for restaurants, menus, prices, current facts and public links.
+When the user directly asks to open a website or Windows item, call the matching tool and report only the tool's real result.
+Never claim an action succeeded before its tool result. Never request or expose passwords, API keys, payment details or private credentials.
+Do not bypass Windows security, execute arbitrary command strings, make purchases, disable security, or perform destructive actions.
+""".strip()
+    session = {
+        "type": "realtime",
+        "model": OPENAI_REALTIME_MODEL,
+        "output_modalities": ["audio"],
+        "instructions": instructions,
+        "tools": tools,
+        "tool_choice": "auto",
+        "audio": {
+            "input": {
+                "format": {"type": "audio/pcm", "rate": 24000},
+                "noise_reduction": {"type": "near_field"},
+                "transcription": {
+                    "model": OPENAI_TRANSCRIBE_MODEL,
+                    "language": "en",
+                    "prompt": "Australian English. Names include LJ AI, LEXI, Jarvis, Cedar, Mudgee, OctoVPN and OpenVPN.",
+                },
+                "turn_detection": {
+                    "type": "semantic_vad",
+                    "eagerness": "high",
+                    "create_response": True,
+                    "interrupt_response": True,
+                },
+            },
+            "output": {"format": {"type": "audio/pcm"}, "voice": voice},
+        },
+    }
+    client = _shared_http_client()
+    safety_identifier = hashlib.sha256(f"lj-ai:{identity.user_id}".encode()).hexdigest()
+    try:
+        response = await client.post(
+            "https://api.openai.com/v1/realtime/client_secrets",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+                "OpenAI-Safety-Identifier": safety_identifier,
+            },
+            json={"session": session},
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail="Realtime voice is currently unreachable.") from exc
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=_safe_upstream_message(response, "Realtime voice could not start."),
+        )
+    data = response.json()
+    await _insert_audit(identity.user_id, "REALTIME_SESSION_STARTED", {"model": OPENAI_REALTIME_MODEL})
+    return {
+        "value": data.get("value"),
+        "expires_at": data.get("expires_at"),
+        "model": OPENAI_REALTIME_MODEL,
+        "voice": voice,
     }
 
 
@@ -1347,6 +1780,77 @@ async def admin_users(identity: Identity = Depends(current_identity)) -> list[di
         row["online"] = bool(last_seen and last_seen >= online_cutoff)
         row["effective_plan"] = _effective_plan(row)
     return rows
+
+
+@app.get("/v1/admin/recovery-requests")
+async def admin_recovery_requests(identity: Identity = Depends(current_identity)) -> list[dict[str, Any]]:
+    require_admin(identity)
+    rows = await _rest_request(
+        "GET",
+        "password_recovery_requests",
+        params={
+            "select": "id,user_id,username,email,status,created_at,updated_at,expires_at,approved_at,completed_at",
+            "order": "updated_at.desc",
+            "limit": "200",
+        },
+    ) or []
+    for item in rows:
+        item["messages"] = await _rest_request(
+            "GET",
+            "password_recovery_messages",
+            params={
+                "request_id": f"eq.{item['id']}",
+                "select": "id,sender,message,created_at",
+                "order": "created_at.asc",
+                "limit": "100",
+            },
+        ) or []
+    return rows
+
+
+@app.post("/v1/admin/recovery-requests/{request_id}/action")
+async def admin_recovery_action(
+    request_id: str,
+    body: AdminRecoveryActionRequest,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    require_admin(identity)
+    rows = await _rest_request(
+        "GET",
+        "password_recovery_requests",
+        params={"id": f"eq.{request_id}", "select": "*", "limit": "1"},
+    ) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Recovery request not found.")
+    item = rows[0]
+    if item.get("status") in {"COMPLETED", "EXPIRED"}:
+        raise HTTPException(status_code=409, detail="That recovery request is already closed.")
+    now = datetime.now(timezone.utc).isoformat()
+    if body.reply.strip():
+        await _rest_request(
+            "POST",
+            "password_recovery_messages",
+            payload={"request_id": request_id, "sender": "ADMIN", "message": body.reply.strip()},
+            prefer="return=minimal",
+        )
+    updates: dict[str, Any] = {"updated_at": now}
+    if body.action == "APPROVE":
+        updates.update({"status": "APPROVED", "approved_by": identity.user_id, "approved_at": now})
+    elif body.action == "DENY":
+        updates.update({"status": "DENIED", "approved_by": identity.user_id})
+    await _rest_request(
+        "PATCH",
+        "password_recovery_requests",
+        params={"id": f"eq.{request_id}"},
+        payload=updates,
+        prefer="return=minimal",
+    )
+    await _insert_audit(
+        identity.user_id,
+        f"RECOVERY_{body.action}",
+        {"request_id": request_id, "target_user_id": item.get("user_id")},
+    )
+    return {"ok": True, "status": updates.get("status", item.get("status"))}
 
 
 @app.patch("/v1/admin/users/{user_id}/plan")
