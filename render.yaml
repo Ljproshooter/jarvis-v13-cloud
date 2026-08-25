@@ -55,10 +55,10 @@ services:
       - key: SUPPORT_TELEGRAM
         sync: false
       - key: CLIENT_LATEST_VERSION
-        value: 15.1.0
+        value: 15.3.0
       - key: CLIENT_UPDATE_URL
         sync: false
       - key: CLIENT_UPDATE_SHA256
         sync: false
       - key: CLIENT_UPDATE_NOTES
-        value: V15.1.0 account/admin fixes, automatic local area, responsive navigation, dark title bar and plan-aware microphone controls.
+        value: V15.3.0 secure two-device limit, manual saved-account login and spoken sign-in briefing for every plan.

@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V15 Cloud"
-APP_VERSION = "15.1.0"
+APP_VERSION = "15.3.0"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -67,8 +67,10 @@ CLIENT_UPDATE_NOTES = os.getenv("CLIENT_UPDATE_NOTES", "LJ AI is up to date.").s
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "75"))
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(15 * 1024 * 1024)))
 MAX_HISTORY_TURNS = 20
+MAX_DEVICES_PER_ACCOUNT = 2
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,24}$")
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 
 PLAN_LIMITS: dict[str, int | None] = {
     "FREE": 15,
@@ -316,6 +318,7 @@ class SlidingWindowLimiter:
 
 limiter = SlidingWindowLimiter()
 _seen_updates: dict[str, float] = {}
+_device_auth_cache: dict[tuple[str, str, str], float] = {}
 
 
 class Identity(BaseModel):
@@ -327,7 +330,110 @@ class Identity(BaseModel):
     effective_plan: str
     account_status: str
     plan_expires_at: str | None = None
+    device_id: str
     access_token: str = Field(exclude=True)
+
+
+def _device_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _validate_device_credentials(device_id: str | None, device_token: str | None) -> tuple[str, str]:
+    clean_id = str(device_id or "").strip()
+    clean_token = str(device_token or "").strip()
+    if not DEVICE_ID_PATTERN.fullmatch(clean_id) or len(clean_token) < 32:
+        raise HTTPException(
+            status_code=401,
+            detail="This app session is not registered to a device. Install the latest LJ AI update and sign in again.",
+        )
+    return clean_id, clean_token
+
+
+def _clear_device_cache(user_id: str, device_id: str) -> None:
+    for key in list(_device_auth_cache):
+        if key[0] == user_id and key[1] == device_id:
+            _device_auth_cache.pop(key, None)
+
+
+async def _verify_registered_device(user_id: str, device_id: str, device_token: str) -> None:
+    token_hash = _device_token_hash(device_token)
+    cache_key = (user_id, device_id, token_hash)
+    now = time.monotonic()
+    if _device_auth_cache.get(cache_key, 0.0) > now:
+        return
+    rows = await _rest_request(
+        "GET",
+        "account_devices",
+        params={
+            "user_id": f"eq.{user_id}",
+            "device_id": f"eq.{device_id}",
+            "device_token_hash": f"eq.{token_hash}",
+            "is_active": "eq.true",
+            "select": "device_id",
+            "limit": "1",
+        },
+    ) or []
+    if not rows:
+        raise HTTPException(
+            status_code=401,
+            detail="This device is no longer signed in. Use Login with last account or enter your password again.",
+        )
+    _device_auth_cache[cache_key] = now + 45.0
+    if len(_device_auth_cache) > 10_000:
+        for key, expiry in list(_device_auth_cache.items())[:1000]:
+            if expiry <= now:
+                _device_auth_cache.pop(key, None)
+    try:
+        await _rest_request(
+            "PATCH",
+            "account_devices",
+            params={"user_id": f"eq.{user_id}", "device_id": f"eq.{device_id}"},
+            payload={"last_seen_at": datetime.now(timezone.utc).isoformat()},
+            prefer="return=minimal",
+        )
+    except HTTPException:
+        pass
+
+
+async def _register_device(
+    user_id: str,
+    device_id: str,
+    device_name: str,
+    platform_name: str,
+) -> str:
+    if not DEVICE_ID_PATTERN.fullmatch(device_id):
+        raise HTTPException(status_code=400, detail="The app supplied an invalid device identity.")
+    token = secrets.token_urlsafe(48)
+    try:
+        result = await _rpc(
+            "register_lj_device",
+            {
+                "p_user_id": user_id,
+                "p_device_id": device_id,
+                "p_device_name": device_name.strip()[:80] or "LJ AI device",
+                "p_platform": platform_name.strip()[:80] or "Unknown platform",
+                "p_token_hash": _device_token_hash(token),
+                "p_max_devices": MAX_DEVICES_PER_ACCOUNT,
+            },
+        )
+    except HTTPException as error:
+        if error.status_code == 502:
+            raise HTTPException(
+                status_code=503,
+                detail="Device security is not ready yet. The owner must run the V15.3 database update.",
+            ) from None
+        raise
+    row = result[0] if isinstance(result, list) and result else result
+    if not isinstance(row, dict) or not bool(row.get("allowed")):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This account already has two signed-in devices. Sign out a device from Devices & Pairing, "
+                "then try again."
+            ),
+        )
+    _clear_device_cache(user_id, device_id)
+    return token
 
 
 async def _load_profile(user_id: str) -> dict[str, Any]:
@@ -481,6 +587,8 @@ async def _mark_seen(user_id: str) -> None:
 async def current_identity(
     request: Request,
     authorization: str | None = Header(default=None),
+    x_lj_device_id: str | None = Header(default=None),
+    x_lj_device_token: str | None = Header(default=None),
 ) -> Identity:
     _require_configuration()
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -498,6 +606,8 @@ async def current_identity(
     user_id = str(user.get("id") or "")
     if not user_id:
         raise HTTPException(status_code=401, detail="Sign-in session is invalid or expired.")
+    device_id, device_token = _validate_device_credentials(x_lj_device_id, x_lj_device_token)
+    await _verify_registered_device(user_id, device_id, device_token)
     profile = await _load_profile(user_id)
     if profile.get("account_status") != "ACTIVE":
         raise HTTPException(status_code=403, detail="This account is not active.")
@@ -512,6 +622,7 @@ async def current_identity(
         effective_plan=_effective_plan(profile),
         account_status=str(profile.get("account_status") or "ACTIVE"),
         plan_expires_at=profile.get("plan_expires_at"),
+        device_id=device_id,
         access_token=access_token,
     )
 
@@ -525,6 +636,9 @@ class SignUpRequest(BaseModel):
     email: str = Field(min_length=5, max_length=254)
     password: str = Field(min_length=6, max_length=128)
     username: str = Field(min_length=3, max_length=24)
+    device_id: str = Field(min_length=8, max_length=128)
+    device_name: str = Field(default="Windows PC", min_length=1, max_length=80)
+    platform: str = Field(default="Windows", min_length=1, max_length=80)
 
     @field_validator("email")
     @classmethod
@@ -542,11 +656,22 @@ class SignUpRequest(BaseModel):
             raise ValueError("Username must be 3-24 letters, numbers, dots, dashes or underscores.")
         return cleaned
 
+    @field_validator("device_id")
+    @classmethod
+    def validate_device_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not DEVICE_ID_PATTERN.fullmatch(cleaned):
+            raise ValueError("The app supplied an invalid device identity.")
+        return cleaned
+
 
 class LoginRequest(BaseModel):
     identifier: str = Field(default="", max_length=254)
     email: str = Field(default="", max_length=254)
     password: str = Field(min_length=1, max_length=128)
+    device_id: str = Field(min_length=8, max_length=128)
+    device_name: str = Field(default="Windows PC", min_length=1, max_length=80)
+    platform: str = Field(default="Windows", min_length=1, max_length=80)
 
     @model_validator(mode="after")
     def require_identifier(self) -> "LoginRequest":
@@ -554,6 +679,9 @@ class LoginRequest(BaseModel):
         if len(value) < 3:
             raise ValueError("Enter your email address or username.")
         self.identifier = value
+        if not DEVICE_ID_PATTERN.fullmatch(self.device_id.strip()):
+            raise ValueError("The app supplied an invalid device identity.")
+        self.device_id = self.device_id.strip()
         return self
 
 
@@ -583,6 +711,8 @@ class AdminRecoveryActionRequest(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str = Field(min_length=20, max_length=4096)
+    device_id: str = Field(min_length=8, max_length=128)
+    device_token: str = Field(min_length=32, max_length=512)
 
 
 class ChatTurn(BaseModel):
@@ -675,6 +805,18 @@ class BroadcastRequest(BaseModel):
         return value.strip()
 
 
+class CommunityMessageRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=500)
+
+    @field_validator("message")
+    @classmethod
+    def clean_community_message(cls, value: str) -> str:
+        cleaned = " ".join(value.split())
+        if not cleaned:
+            raise ValueError("Write a message first.")
+        return cleaned
+
+
 class PlanChangeRequest(BaseModel):
     plan: Literal["FREE", "PREMIUM", "PREMIUM_PLUS", "VIP"]
     days: int = Field(default=30, ge=1, le=365)
@@ -699,7 +841,7 @@ if origins:
         allow_origins=origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "X-LJ-Device-ID", "X-LJ-Device-Token"],
     )
 
 
@@ -772,6 +914,17 @@ async def signup(body: SignUpRequest, request: Request) -> dict[str, Any]:
     )
     if not session.get("access_token"):
         raise HTTPException(status_code=502, detail="Account created, but automatic sign-in failed. Please sign in normally.")
+    user_id = str((session.get("user") or {}).get("id") or user.get("id") or "")
+    if not user_id:
+        raise HTTPException(status_code=502, detail="Account created, but its device session could not be registered.")
+    device_token = await _register_device(
+        user_id,
+        body.device_id,
+        body.device_name,
+        body.platform,
+    )
+    session["device_id"] = body.device_id
+    session["device_token"] = device_token
     return {
         "created": True,
         "confirmation_required": False,
@@ -799,10 +952,29 @@ async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
     user_id = str(user.get("id") or "")
     if user_id:
         try:
+            device_token = await _register_device(
+                user_id,
+                body.device_id,
+                body.device_name,
+                body.platform,
+            )
+        except HTTPException:
+            try:
+                await _auth_request("POST", "logout", access_token=str(result.get("access_token") or ""))
+            except HTTPException:
+                pass
+            raise
+        result["device_id"] = body.device_id
+        result["device_token"] = device_token
+        try:
             await _rpc("record_jarvis_login", {"p_user_id": user_id})
         except HTTPException:
             pass
-        await _insert_audit(user_id, "LOGIN", {"source": "desktop_app"})
+        await _insert_audit(
+            user_id,
+            "LOGIN",
+            {"source": "desktop_app", "device_id": body.device_id, "device_name": body.device_name[:80]},
+        )
     return result
 
 
@@ -933,17 +1105,44 @@ async def complete_recovery_request(
 
 @app.post("/v1/auth/refresh")
 async def refresh(body: RefreshRequest) -> dict[str, Any]:
-    return await _auth_request(
+    device_id, device_token = _validate_device_credentials(body.device_id, body.device_token)
+    result = await _auth_request(
         "POST",
         "token?grant_type=refresh_token",
         payload={"refresh_token": body.refresh_token},
     )
+    user_id = str((result.get("user") or {}).get("id") or "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="The saved sign-in has expired. Enter your password again.")
+    await _verify_registered_device(user_id, device_id, device_token)
+    result["device_id"] = device_id
+    result["device_token"] = device_token
+    return result
 
 
 @app.post("/v1/auth/logout", status_code=204)
 async def logout(identity: Identity = Depends(current_identity)) -> None:
-    await _auth_request("POST", "logout", access_token=identity.access_token)
-    await _insert_audit(identity.user_id, "LOGOUT", {"source": "desktop_app"})
+    await _rest_request(
+        "PATCH",
+        "account_devices",
+        params={"user_id": f"eq.{identity.user_id}", "device_id": f"eq.{identity.device_id}"},
+        payload={
+            "is_active": False,
+            "revoked_at": datetime.now(timezone.utc).isoformat(),
+            "last_seen_at": datetime.now(timezone.utc).isoformat(),
+        },
+        prefer="return=minimal",
+    )
+    _clear_device_cache(identity.user_id, identity.device_id)
+    try:
+        await _auth_request("POST", "logout", access_token=identity.access_token)
+    except HTTPException:
+        pass
+    await _insert_audit(
+        identity.user_id,
+        "LOGOUT",
+        {"source": "desktop_app", "device_id": identity.device_id},
+    )
     return None
 
 
@@ -960,6 +1159,16 @@ async def me(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
         },
     ) or []
     messages_used = int(usage_rows[0].get("messages") or 0) if usage_rows else 0
+    device_rows = await _rest_request(
+        "GET",
+        "account_devices",
+        params={
+            "user_id": f"eq.{identity.user_id}",
+            "is_active": "eq.true",
+            "select": "device_id",
+            "limit": str(MAX_DEVICES_PER_ACCOUNT + 1),
+        },
+    ) or []
     return {
         "id": identity.user_id,
         "email": identity.email,
@@ -972,7 +1181,70 @@ async def me(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
         "messages_used": messages_used,
         "voice_enabled": identity.effective_plan in VOICE_PLANS,
         "cedar_enabled": identity.effective_plan in CEDAR_PLANS,
+        "device_id": identity.device_id,
+        "active_devices": len(device_rows),
+        "max_devices": MAX_DEVICES_PER_ACCOUNT,
     }
+
+
+@app.get("/v1/devices")
+async def devices(identity: Identity = Depends(current_identity)) -> list[dict[str, Any]]:
+    rows = await _rest_request(
+        "GET",
+        "account_devices",
+        params={
+            "user_id": f"eq.{identity.user_id}",
+            "is_active": "eq.true",
+            "select": "device_id,device_name,platform,created_at,last_seen_at",
+            "order": "last_seen_at.desc",
+            "limit": str(MAX_DEVICES_PER_ACCOUNT),
+        },
+    ) or []
+    return [
+        {
+            **row,
+            "current": str(row.get("device_id") or "") == identity.device_id,
+            "max_devices": MAX_DEVICES_PER_ACCOUNT,
+        }
+        for row in rows
+    ]
+
+
+@app.delete("/v1/devices/{device_id}")
+async def revoke_device(
+    device_id: str,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    if not DEVICE_ID_PATTERN.fullmatch(device_id):
+        raise HTTPException(status_code=404, detail="Device not found.")
+    rows = await _rest_request(
+        "GET",
+        "account_devices",
+        params={
+            "user_id": f"eq.{identity.user_id}",
+            "device_id": f"eq.{device_id}",
+            "is_active": "eq.true",
+            "select": "device_id",
+            "limit": "1",
+        },
+    ) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Device not found or already signed out.")
+    now = datetime.now(timezone.utc).isoformat()
+    await _rest_request(
+        "PATCH",
+        "account_devices",
+        params={"user_id": f"eq.{identity.user_id}", "device_id": f"eq.{device_id}"},
+        payload={"is_active": False, "revoked_at": now, "last_seen_at": now},
+        prefer="return=minimal",
+    )
+    _clear_device_cache(identity.user_id, device_id)
+    await _insert_audit(
+        identity.user_id,
+        "DEVICE_SIGNED_OUT",
+        {"device_id": device_id, "current_device": device_id == identity.device_id},
+    )
+    return {"signed_out": True, "current_device": device_id == identity.device_id}
 
 
 @app.post("/v1/presence")
@@ -1726,6 +1998,65 @@ async def broadcasts(identity: Identity = Depends(current_identity)) -> list[dic
         row["read_at"] = read_map.get(row["id"])
         row["unread"] = row["id"] not in read_map
     return visible
+
+
+@app.get("/v1/community/messages")
+async def community_messages(identity: Identity = Depends(current_identity)) -> list[dict[str, Any]]:
+    await limiter.enforce(f"community-read:{identity.user_id}", 120, 60)
+    rows = await _rest_request(
+        "GET",
+        "community_messages",
+        params={
+            "select": "id,user_id,username,message,created_at",
+            "order": "created_at.desc",
+            "limit": "100",
+        },
+    ) or []
+    for row in rows:
+        row["is_mine"] = str(row.get("user_id") or "") == identity.user_id
+        row.pop("user_id", None)
+    return rows
+
+
+@app.post("/v1/community/messages", status_code=201)
+async def send_community_message(
+    body: CommunityMessageRequest,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    await limiter.enforce(f"community-send:{identity.user_id}", 8, 60)
+    rows = await _rest_request(
+        "POST",
+        "community_messages",
+        payload={
+            "user_id": identity.user_id,
+            "username": identity.username[:24],
+            "message": body.message,
+        },
+        prefer="return=representation",
+    )
+    if not rows:
+        raise HTTPException(status_code=502, detail="The community service did not save that message.")
+    await _insert_audit(identity.user_id, "COMMUNITY_MESSAGE_SENT", {"message_id": rows[0]["id"]})
+    result = rows[0]
+    result["is_mine"] = True
+    result.pop("user_id", None)
+    return result
+
+
+@app.delete("/v1/admin/community/messages/{message_id}", status_code=204)
+async def admin_delete_community_message(
+    message_id: str,
+    identity: Identity = Depends(current_identity),
+) -> None:
+    require_admin(identity)
+    await _rest_request(
+        "DELETE",
+        "community_messages",
+        params={"id": f"eq.{message_id}"},
+        prefer="return=minimal",
+    )
+    await _insert_audit(identity.user_id, "COMMUNITY_MESSAGE_DELETED", {"message_id": message_id})
+    return None
 
 
 @app.post("/v1/broadcasts/{broadcast_id}/read", status_code=204)
