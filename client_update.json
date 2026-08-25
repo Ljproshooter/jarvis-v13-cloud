@@ -2,5 +2,5 @@
   "version": "15.6.0",
   "download_url": "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/latest/download/LJ_AI_Setup.exe",
   "sha256": "",
-  "notes": "V15.6.0 adds Image Chat, trusted diagnostics, reliable multi-turn Realtime echo control and spoken briefing fallback."
+  "notes": "V15.6.0 adds Image Chat, trusted diagnostics, a timed multi-turn Realtime echo guard and reliable OpenAI-voice sign-in briefings."
 }
