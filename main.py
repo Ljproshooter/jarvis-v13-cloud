@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V15 Cloud"
-APP_VERSION = "15.6.0"
+APP_VERSION = "15.7.0"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -1856,8 +1856,8 @@ END LJ AI APP SNAPSHOT
 You are {bot_name}, LJ AI's live voice companion created by LJ. Address the user as sir naturally.
 Speak at a normal, confident, polished pace with a subtle futuristic quality. Respond promptly and usually in two to five sentences.
 Use Australian English. The default weather location is {body.weather_location}. The selected personality is {body.personality.lower()}.
-This is a live speech conversation: allow natural pauses and do not interrupt unnecessarily.
-Voice interruptions are {"enabled" if body.allow_interruptions else "disabled"}; when disabled, finish speaking before accepting the next turn.
+This is a live speech conversation: allow natural pauses, do not interrupt unnecessarily, and answer every completed user turn.
+Client-side barge-in is {"enabled" if body.allow_interruptions else "disabled"}.
 {app_bridge_instructions}
 Use get_weather_forecast for current, tomorrow or weekly weather. Use web_lookup for restaurants, menus, prices, current facts and public links.
 When the user directly asks to open a website or Windows item, call the matching tool and report only the tool's real result.
@@ -1866,7 +1866,7 @@ Never request, read or reveal VPN Vault contents, saved passwords, access tokens
 Do not bypass Windows security, execute arbitrary command strings, make purchases, disable security, or perform destructive actions.
 """.strip()
     vad_threshold = {"LOW": 0.72, "NORMAL": 0.55, "HIGH": 0.40}[body.vad_sensitivity]
-    silence_duration_ms = {"SHORT": 300, "NORMAL": 500, "LONG": 850}[body.reply_pause]
+    silence_duration_ms = {"SHORT": 300, "NORMAL": 450, "LONG": 800}[body.reply_pause]
     noise_reduction = None
     if body.noise_reduction != "OFF":
         noise_reduction = {"type": "near_field" if body.noise_reduction == "NEAR FIELD" else "far_field"}
@@ -1892,7 +1892,12 @@ Do not bypass Windows security, execute arbitrary command strings, make purchase
                     "prefix_padding_ms": 250,
                     "silence_duration_ms": silence_duration_ms,
                     "create_response": True,
-                    "interrupt_response": body.allow_interruptions,
+                    # Keep automatic server responses reliable. OpenAI notes
+                    # that create_response may fail while a response is still
+                    # active when interrupt_response is false. The Windows
+                    # client enforces the user's barge-in choice by gating its
+                    # microphone only during physical speaker writes.
+                    "interrupt_response": True,
                 },
             },
             "output": {
