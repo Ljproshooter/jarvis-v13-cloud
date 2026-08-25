@@ -1,6 +1,6 @@
 {
-  "version": "14.1.0",
-  "download_url": "",
+  "version": "15.1.0",
+  "download_url": "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/latest/download/LJ_AI_Setup.exe",
   "sha256": "",
-  "notes": "Realtime connection repair: practical reconnect allowance, persistent diagnostics and faster silence-based voice turn detection."
+  "notes": "V15.1.0 account/admin fixes, automatic local area, responsive navigation, dark title bar and plan-aware microphone controls."
 }

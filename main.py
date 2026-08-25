@@ -1,4 +1,4 @@
-"""LJ AI V14.1 Cloud API.
+"""LJ AI V15 Cloud API.
 
 All private credentials stay in Render environment variables. The distributed
 Windows client authenticates users here and never receives the OpenAI or
@@ -29,8 +29,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-APP_NAME = "LJ AI V14.1 Cloud"
-APP_VERSION = "14.1.0"
+APP_NAME = "LJ AI V15 Cloud"
+APP_VERSION = "15.1.0"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -523,7 +523,7 @@ def require_admin(identity: Identity) -> None:
 
 class SignUpRequest(BaseModel):
     email: str = Field(min_length=5, max_length=254)
-    password: str = Field(min_length=10, max_length=128)
+    password: str = Field(min_length=6, max_length=128)
     username: str = Field(min_length=3, max_length=24)
 
     @field_validator("email")
@@ -573,7 +573,7 @@ class RecoveryMessageRequest(BaseModel):
 
 class RecoveryCompleteRequest(BaseModel):
     secret: str = Field(min_length=20, max_length=300)
-    new_password: str = Field(min_length=10, max_length=128)
+    new_password: str = Field(min_length=6, max_length=128)
 
 
 class AdminRecoveryActionRequest(BaseModel):
@@ -619,7 +619,7 @@ class RealtimeTokenRequest(BaseModel):
     bot_name: str = Field(default="LJ AI", min_length=1, max_length=30)
     personality: Literal["ADAPTIVE", "COMPOSED", "WARM", "SASSY", "SERIOUS"] = "ADAPTIVE"
     permission_mode: Literal["SAFE", "FULL ACCESS"] = "SAFE"
-    weather_location: str = Field(default="Mudgee, NSW", min_length=2, max_length=120)
+    weather_location: str = Field(default="your local area", min_length=2, max_length=120)
     voice: str = Field(default="cedar", min_length=2, max_length=30)
 
 
@@ -678,6 +678,10 @@ class BroadcastRequest(BaseModel):
 class PlanChangeRequest(BaseModel):
     plan: Literal["FREE", "PREMIUM", "PREMIUM_PLUS", "VIP"]
     days: int = Field(default=30, ge=1, le=365)
+
+
+class RoleChangeRequest(BaseModel):
+    role: Literal["ADMIN", "USER"]
 
 
 app = FastAPI(
@@ -1896,6 +1900,33 @@ async def admin_change_plan(
         identity.user_id,
         "PLAN_CHANGED",
         {"user_id": user_id, "new_plan": body.plan, "days": body.days if expiry else None},
+    )
+    return rows[0]
+
+
+@app.patch("/v1/admin/users/{user_id}/role")
+async def admin_change_role(
+    user_id: str,
+    body: RoleChangeRequest,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    require_admin(identity)
+    if user_id == identity.user_id:
+        raise HTTPException(status_code=400, detail="You cannot change your own administrator role.")
+    target = await _load_profile(user_id)
+    if str(target.get("account_status") or "") != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Only active accounts can become administrators.")
+    rows = await _rest_request(
+        "PATCH",
+        "profiles",
+        params={"id": f"eq.{user_id}"},
+        payload={"role": body.role},
+        prefer="return=representation",
+    )
+    await _insert_audit(
+        identity.user_id,
+        "ROLE_CHANGED",
+        {"user_id": user_id, "new_role": body.role},
     )
     return rows[0]
 
