@@ -34,6 +34,8 @@ services:
         value: cedar
       - key: OPENAI_WEB_MODEL
         value: gpt-5.6-luna
+      - key: OPENAI_IMAGE_MODEL
+        value: gpt-5.6
       - key: OPENAI_TEXT_FAST_MODEL
         value: gpt-5.6-luna
       - key: OPENAI_TEXT_SERVICE_TIER
@@ -55,10 +57,10 @@ services:
       - key: SUPPORT_TELEGRAM
         sync: false
       - key: CLIENT_LATEST_VERSION
-        value: 15.4.0
+        sync: false
       - key: CLIENT_UPDATE_URL
         sync: false
       - key: CLIENT_UPDATE_SHA256
         sync: false
       - key: CLIENT_UPDATE_NOTES
-        value: V15.4.0 restores reliable audio and Realtime voice, upgrades the Voice UI, repairs Community messaging and adds Clear All News.
+        sync: false
