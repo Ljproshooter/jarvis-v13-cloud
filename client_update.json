@@ -1,6 +1,6 @@
 {
-  "version": "15.3.0",
+  "version": "15.4.0",
   "download_url": "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/latest/download/LJ_AI_Setup.exe",
   "sha256": "",
-  "notes": "V15.3.0 secure two-device limit, manual saved-account login and spoken sign-in briefing for every plan."
+  "notes": "V15.4.0 restores reliable audio and Realtime voice, upgrades the Voice UI, repairs Community messaging and adds Clear All News."
 }

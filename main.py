@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V15 Cloud"
-APP_VERSION = "15.3.0"
+APP_VERSION = "15.4.0"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -881,13 +881,13 @@ async def health() -> JSONResponse:
 
 
 @app.get("/v1/client/update")
-async def client_update() -> dict[str, Any]:
-    return {
+async def client_update() -> JSONResponse:
+    return JSONResponse(content={
         "version": CLIENT_LATEST_VERSION,
         "download_url": CLIENT_UPDATE_URL if CLIENT_UPDATE_URL.startswith("https://") else "",
         "sha256": CLIENT_UPDATE_SHA256 if re.fullmatch(r"[0-9a-f]{64}", CLIENT_UPDATE_SHA256) else "",
         "notes": CLIENT_UPDATE_NOTES[:2000],
-    }
+    }, headers={"Cache-Control": "no-store, max-age=0"})
 
 
 @app.post("/v1/auth/signup", status_code=201)
@@ -1721,7 +1721,11 @@ Do not bypass Windows security, execute arbitrary command strings, make purchase
                     "interrupt_response": True,
                 },
             },
-            "output": {"format": {"type": "audio/pcm"}, "voice": voice},
+            "output": {
+                "format": {"type": "audio/pcm", "rate": 24000},
+                "voice": voice,
+                "speed": 1.0,
+            },
         },
     }
     client = _shared_http_client()
@@ -2301,6 +2305,20 @@ async def admin_list_broadcasts(identity: Identity = Depends(current_identity)) 
         "broadcasts",
         params={"select": "*", "order": "created_at.desc", "limit": "200"},
     )
+
+
+@app.delete("/v1/admin/broadcasts", status_code=204)
+async def admin_clear_broadcasts(identity: Identity = Depends(current_identity)) -> None:
+    """Remove all published news after an explicit administrator confirmation in the app."""
+    require_admin(identity)
+    await _rest_request(
+        "DELETE",
+        "broadcasts",
+        params={"id": "not.is.null"},
+        prefer="return=minimal",
+    )
+    await _insert_audit(identity.user_id, "BROADCASTS_CLEARED", {})
+    return None
 
 
 @app.delete("/v1/admin/broadcasts/{broadcast_id}", status_code=204)

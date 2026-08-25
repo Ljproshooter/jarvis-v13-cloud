@@ -55,10 +55,10 @@ services:
       - key: SUPPORT_TELEGRAM
         sync: false
       - key: CLIENT_LATEST_VERSION
-        value: 15.3.0
+        value: 15.4.0
       - key: CLIENT_UPDATE_URL
         sync: false
       - key: CLIENT_UPDATE_SHA256
         sync: false
       - key: CLIENT_UPDATE_NOTES
-        value: V15.3.0 secure two-device limit, manual saved-account login and spoken sign-in briefing for every plan.
+        value: V15.4.0 restores reliable audio and Realtime voice, upgrades the Voice UI, repairs Community messaging and adds Clear All News.
