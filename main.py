@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V15 Cloud"
-APP_VERSION = "15.7.0"
+APP_VERSION = "15.8.0"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
