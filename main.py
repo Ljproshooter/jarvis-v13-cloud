@@ -64,6 +64,10 @@ CLIENT_LATEST_VERSION = os.getenv("CLIENT_LATEST_VERSION", APP_VERSION).strip()
 CLIENT_UPDATE_URL = os.getenv("CLIENT_UPDATE_URL", "").strip()
 CLIENT_UPDATE_SHA256 = os.getenv("CLIENT_UPDATE_SHA256", "").strip().lower()
 CLIENT_UPDATE_NOTES = os.getenv("CLIENT_UPDATE_NOTES", "LJ AI is up to date.").strip()
+CLIENT_INSTALLER_SOURCE_URL = (
+    "https://github.com/Ljproshooter/jarvis-v13-cloud/"
+    "releases/latest/download/LJ_AI_Setup.exe"
+)
 
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "75"))
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(15 * 1024 * 1024)))
@@ -956,6 +960,68 @@ async def client_update() -> JSONResponse:
         "sha256": CLIENT_UPDATE_SHA256 if re.fullmatch(r"[0-9a-f]{64}", CLIENT_UPDATE_SHA256) else "",
         "notes": CLIENT_UPDATE_NOTES[:2000],
     }, headers={"Cache-Control": "no-store, max-age=0"})
+
+
+@app.get("/v1/client/download")
+async def client_download() -> StreamingResponse:
+    """Stream the signed GitHub installer through LJ AI Cloud.
+
+    Older packaged Windows clients can validate Render's TLS connection but
+    may fail while following GitHub's release-asset redirect. The destination
+    is deliberately fixed so this endpoint cannot be used as an open proxy.
+    The Windows client still verifies the published SHA-256 before launching
+    anything, and discards a partial or mismatched download.
+    """
+    client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0),
+    )
+    request = client.build_request(
+        "GET",
+        CLIENT_INSTALLER_SOURCE_URL,
+        headers={
+            "Accept": "application/octet-stream",
+            "Accept-Encoding": "identity",
+            "User-Agent": f"LJ-AI-Cloud/{APP_VERSION}",
+        },
+    )
+    try:
+        upstream = await client.send(request, stream=True)
+    except httpx.RequestError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=503, detail="The LJ AI installer is temporarily unavailable.") from exc
+
+    if upstream.status_code != 200:
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="GitHub did not provide the LJ AI installer.")
+
+    content_length = upstream.headers.get("Content-Length", "").strip()
+    if content_length.isdigit() and int(content_length) > 200 * 1024 * 1024:
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="The published LJ AI installer is unexpectedly large.")
+
+    async def installer_stream():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                if chunk:
+                    yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    headers = {
+        "Content-Disposition": 'attachment; filename="LJ_AI_Setup.exe"',
+        "Cache-Control": "no-store, max-age=0",
+    }
+    if content_length.isdigit():
+        headers["Content-Length"] = content_length
+    return StreamingResponse(
+        installer_stream(),
+        media_type="application/octet-stream",
+        headers=headers,
+    )
 
 
 @app.post("/v1/auth/signup", status_code=201)

@@ -1,6 +1,6 @@
 {
-    "version":  "15.9.1",
-    "download_url":  "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/latest/download/LJ_AI_Setup.exe",
-    "sha256":  "aa1252e21a120b30e0754cc9c172c8d03587d5afeffff6461e54a5e30e269205",
-    "notes":  "LJ AI V15.9.1 adds the linked Windows and Android platform, six-photo image workflows, screen and mouse voice tools, secure billing, crash-safe Realtime audio and automatic Realtime reconnection."
+  "version": "15.9.1",
+  "download_url": "https://jarvis-v13-cloud.onrender.com/v1/client/download",
+  "sha256": "aa1252e21a120b30e0754cc9c172c8d03587d5afeffff6461e54a5e30e269205",
+  "notes": "LJ AI V15.9.1 adds the linked Windows and Android platform, six-photo image workflows, screen and mouse voice tools, secure billing, crash-safe Realtime audio and automatic Realtime reconnection."
 }
