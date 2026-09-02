@@ -1,6 +1,6 @@
 {
-  "version": "15.8.0",
+  "version": "15.9.1",
   "download_url": "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/latest/download/LJ_AI_Setup.exe",
   "sha256": "",
-  "notes": "V15.8.0 fixes authenticated OpenAI sign-in briefing playback while preserving stable multi-turn Realtime voice."
+  "notes": "V15.9 links Windows and Android, adds crash-safe Windows audio, natural screen/mouse voice control, six-photo workflows and secure billing."
 }

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: jarvis-v13-cloud
+    name: lj-ai-mobile-staging
     runtime: python
     plan: free
     autoDeploy: true
@@ -48,7 +48,53 @@ services:
         value: gpt-realtime-2.1
       - key: OPENAI_REALTIME_VOICE
         value: cedar
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "75"
+      - key: MAX_AUDIO_BYTES
+        value: "15728640"
+      - key: ALLOWED_ORIGINS
+        sync: false
       - key: PAYPAL_CHECKOUT_URL
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_BASIC_MONTHLY
+        sync: false
+      - key: STRIPE_PRICE_BASIC_3_MONTHS
+        sync: false
+      - key: STRIPE_PRICE_BASIC_YEARLY
+        sync: false
+      - key: STRIPE_PRICE_PREMIUM_MONTHLY
+        sync: false
+      - key: STRIPE_PRICE_PREMIUM_3_MONTHS
+        sync: false
+      - key: STRIPE_PRICE_PREMIUM_YEARLY
+        sync: false
+      - key: STRIPE_PRICE_VIP_MONTHLY
+        sync: false
+      - key: STRIPE_PRICE_VIP_3_MONTHS
+        sync: false
+      - key: STRIPE_PRICE_VIP_YEARLY
+        sync: false
+      - key: STRIPE_SUCCESS_URL
+        value: "https://lj-ai-mobile-staging.onrender.com/v1/billing/success?session_id={CHECKOUT_SESSION_ID}"
+      - key: STRIPE_CANCEL_URL
+        value: https://lj-ai-mobile-staging.onrender.com/v1/billing/cancel
+      - key: STRIPE_PORTAL_RETURN_URL
+        value: https://lj-ai-mobile-staging.onrender.com/v1/billing/success
+      - key: SMARTTHINGS_CLIENT_ID
+        sync: false
+      - key: SMARTTHINGS_CLIENT_SECRET
+        sync: false
+      - key: SMARTTHINGS_REDIRECT_URI
+        value: https://lj-ai-mobile-staging.onrender.com/v1/smartthings/oauth/callback
+      - key: SMARTTHINGS_TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: SMARTTHINGS_SCOPES
+        value: "r:devices:* x:devices:* r:locations:* r:scenes:* x:scenes:*"
+      - key: LJ_PAIRING_HMAC_SECRET
         sync: false
       - key: SUPPORT_DISCORD
         value: ljproshooter7229
