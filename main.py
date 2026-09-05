@@ -32,6 +32,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 APP_NAME = "LJ AI V15 Cloud"
 APP_VERSION = "15.9.4"
 
+# V15.9.1-V15.9.3 Windows clients required /health to report their exact
+# installed version before allowing sign-in. Keep that compatibility handshake
+# working long enough for those clients to sign in and use the verified updater.
+# Current clients and every non-Windows caller still receive APP_VERSION.
+LEGACY_WINDOWS_HEALTH_VERSIONS = {"15.9.1", "15.9.2", "15.9.3"}
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -990,13 +996,22 @@ async def root() -> dict[str, str]:
 
 
 @app.get("/health")
-async def health() -> JSONResponse:
+async def health(request: Request) -> JSONResponse:
     if not _configured():
         return JSONResponse(
             status_code=503,
             content={"status": "configuration_required", "missing": _missing_settings()},
         )
-    return JSONResponse(content={"status": "healthy", "version": APP_VERSION})
+    reported_version = APP_VERSION
+    user_agent = request.headers.get("user-agent", "")
+    legacy_windows = re.search(
+        r"(?:^|\s)LJ-AI-Windows/(\d+\.\d+\.\d+)(?:\s|$)",
+        user_agent,
+        flags=re.IGNORECASE,
+    )
+    if legacy_windows and legacy_windows.group(1) in LEGACY_WINDOWS_HEALTH_VERSIONS:
+        reported_version = legacy_windows.group(1)
+    return JSONResponse(content={"status": "healthy", "version": reported_version})
 
 
 @app.get("/v1/client/update")
