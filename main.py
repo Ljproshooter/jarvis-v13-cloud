@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V15 Cloud"
-APP_VERSION = "15.9.3"
+APP_VERSION = "15.9.4"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
@@ -900,7 +900,7 @@ class TicketRequest(BaseModel):
 
 class TicketReplyRequest(BaseModel):
     reply: str = Field(min_length=1, max_length=5000)
-    status: Literal["OPEN", "IN_PROGRESS", "CLOSED"] = "CLOSED"
+    status: Literal["OPEN", "IN_PROGRESS", "CLOSED"] = "IN_PROGRESS"
 
 
 class BroadcastRequest(BaseModel):
@@ -1491,6 +1491,7 @@ Never request, reveal, repeat or store passwords, API keys, payment details or V
 Never claim a computer action succeeded unless a trusted tool result explicitly confirms it.
 The desktop app controls local actions and confirmation; you do not bypass operating-system security.
 Help with lawful defensive network diagnostics, but do not assist attacks, disruption or unauthorized access.
+When the user asks for a link, URL, download page or website, include the complete public https:// URL in the answer. Never hide it behind words such as "click here" so every client can open or copy it.
 The user's display name is {identity.username}. Their plan is {identity.effective_plan}.
 """.strip()
     if identity.role == "ADMIN" and memory:
@@ -1514,6 +1515,58 @@ def _extract_response_text(data: dict[str, Any]) -> str:
                 if isinstance(text, str):
                     parts.append(text)
     return "".join(parts).strip()
+
+
+def _is_link_request(message: str) -> bool:
+    text = " ".join(message.casefold().split())
+    return any(
+        phrase in text
+        for phrase in (
+            "link me", "send me a link", "send the link", "give me a link", "give me the link",
+            "share a link", "share the link", "what is the link", "what's the link", "copyable link",
+            "download link", "download page", "website link", "website for", "url for", "the url",
+            "where can i download", "where do i download",
+        )
+    )
+
+
+def _response_public_urls(data: dict[str, Any]) -> list[str]:
+    """Collect public citation URLs returned by Responses web search."""
+    found: list[str] = []
+
+    def visit(value: Any, key: str = "") -> None:
+        if len(found) >= 3:
+            return
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                visit(child, str(child_key).casefold())
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, key)
+        elif isinstance(value, str) and key in {"url", "uri", "link"}:
+            candidate = value.strip().rstrip(".,);]}")
+            parsed = urlparse(candidate)
+            hostname = (parsed.hostname or "").casefold()
+            if (
+                parsed.scheme == "https"
+                and hostname
+                and hostname not in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+                and candidate not in found
+            ):
+                found.append(candidate)
+
+    visit(data)
+    return found
+
+
+def _ensure_requested_links(message: str, reply: str, data: dict[str, Any]) -> str:
+    if not _is_link_request(message) or re.search(r"https://[^\s<>{}\[\]\"']+", reply):
+        return reply
+    urls = _response_public_urls(data)
+    if not urls:
+        return reply + "\n\nI couldn't verify a safe public link for that result."
+    heading = "Link" if len(urls) == 1 else "Links"
+    return reply.rstrip() + f"\n\n{heading}:\n" + "\n".join(urls)
 
 
 async def _openai_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1635,7 +1688,7 @@ def _needs_web_access(message: str) -> bool:
     web_words = {
         "weather", "forecast", "restaurant", "restaurants", "menu", "menus", "price", "prices",
         "opening", "hours", "address", "directions", "nearby", "news", "latest", "current",
-        "website", "web", "google", "search", "online", "today", "tomorrow", "week",
+        "website", "web", "link", "links", "url", "download", "google", "search", "online", "today", "tomorrow", "week",
     }
     words = set(re.findall(r"[a-z0-9']+", text))
     return any(
@@ -1645,6 +1698,8 @@ def _needs_web_access(message: str) -> bool:
             "menu and prices", "restaurant menu", "tell me about this link", "what is on this website",
             "weather this week", "weekly weather", "seven day forecast", "7 day forecast",
             "what is the menu", "read out the menu", "opening hours", "how much is",
+            "link me", "send me a link", "send the link", "give me a link", "give me the link",
+            "download link", "download page", "website link", "url for", "where can i download",
         )
     ) or bool(words & web_words and words & {"find", "tell", "show", "read", "what", "when", "where", "search", "look", "check", "give"})
 
@@ -1736,6 +1791,7 @@ async def chat(
             "\nThe user explicitly requested current public web information or supplied a public link. "
             "Always use web search before answering. For weather, give the requested days and location. "
             "For restaurants, read the current menu, prices, opening hours and address when available. "
+            "When the user asks for a link, include at least one complete public https:// URL in plain text; never return only a hidden label such as 'click here'. "
             "Keep voice answers easy to listen to and state when a page blocks access. Never access private/local addresses or authenticated accounts."
         )
 
@@ -1743,6 +1799,7 @@ async def chat(
     reply = _extract_response_text(data)
     if not reply:
         raise HTTPException(status_code=502, detail="The AI returned an empty response.")
+    reply = _ensure_requested_links(body.message, reply, data)
     usage = data.get("usage") or {}
     input_tokens = int(usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or 0)
@@ -1780,6 +1837,7 @@ async def web_lookup(
             "You are the public-web research tool for LJ AI. Search before answering. "
             "Return a concise factual answer suitable for being spoken aloud. For a restaurant, include current menu items, "
             "prices, address and opening hours when available. For weather, include every requested forecast day. "
+            "When the request asks for a link, include the complete public https:// URL in plain text so the app can open and copy it. "
             "Never access authenticated pages, private/local network addresses, passwords or payment accounts."
         ),
         "input": body.query + (("\nUseful context: " + body.context) if body.context.strip() else ""),
@@ -1794,6 +1852,7 @@ async def web_lookup(
     reply = _extract_response_text(data)
     if not reply:
         raise HTTPException(status_code=502, detail="The web lookup returned no readable result.")
+    reply = _ensure_requested_links(body.query, reply, data)
     usage = data.get("usage") or {}
     background_tasks.add_task(
         _record_api_usage,
@@ -2150,6 +2209,7 @@ This is a live speech conversation: allow natural pauses, do not interrupt unnec
 Client-side barge-in is {"enabled" if body.allow_interruptions else "disabled"}.
 {app_bridge_instructions}
 Use get_weather_forecast for current, tomorrow or weekly weather. Use web_lookup for restaurants, menus, prices, current facts and public links.
+When the user asks for a link, say and display the complete public https:// URL; never provide only a hidden label such as "click here".
 When the user directly asks to open a website or a supported {platform_label} item, call the matching tool and report only the tool's real result.
 For Windows screen-reading questions, use analyze_current_screen. For visual mouse requests, use screen_guided_mouse so the local app captures and verifies the current screen; never invent coordinates.
 For calls and messages, open only a visible dialler/composer and state clearly when the user must confirm Call or Send.
@@ -3029,6 +3089,30 @@ async def admin_reply_ticket(
     if not rows:
         raise HTTPException(status_code=404, detail="Ticket not found.")
     await _insert_audit(identity.user_id, "TICKET_REPLIED", {"ticket_id": ticket_id})
+    return rows[0]
+
+
+@app.post("/v1/admin/tickets/{ticket_id}/close")
+async def admin_close_ticket(
+    ticket_id: str,
+    identity: Identity = Depends(current_identity),
+) -> Any:
+    """Close a ticket without replacing its most recent administrator reply."""
+    require_admin(identity)
+    rows = await _rest_request(
+        "PATCH",
+        "tickets",
+        params={"id": f"eq.{ticket_id}"},
+        payload={
+            "status": "CLOSED",
+            "replied_by": identity.user_id,
+            "replied_at": datetime.now(timezone.utc).isoformat(),
+        },
+        prefer="return=representation",
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+    await _insert_audit(identity.user_id, "TICKET_CLOSED", {"ticket_id": ticket_id})
     return rows[0]
 
 
