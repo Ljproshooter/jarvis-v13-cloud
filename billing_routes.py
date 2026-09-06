@@ -539,11 +539,16 @@ async def _finish_reconcile_lease(
     rest_request: Callable[..., Any],
     subscription_id: str,
     token: str,
+    reconcile_sequence: int,
 ) -> None:
     result = await _billing_rpc(
         rest_request,
         "finish_lj_billing_reconcile_lease",
-        {"p_subscription_id": subscription_id, "p_lock_token": token},
+        {
+            "p_subscription_id": subscription_id,
+            "p_lock_token": token,
+            "p_reconcile_sequence": reconcile_sequence,
+        },
     )
     value = result[0] if isinstance(result, list) and result else result
     if isinstance(value, dict):
@@ -560,7 +565,7 @@ async def _find_subscription_binding(
 ) -> dict[str, Any]:
     fields = (
         "user_id,plan_key,billing_period,status,stripe_customer_id,stripe_subscription_id,"
-        "stripe_price_id,currency,current_period_start,current_period_end"
+        "stripe_subscription_created,stripe_price_id,currency,current_period_start,current_period_end"
     )
     by_subscription: list[dict[str, Any]] = []
     if subscription_id:
@@ -670,6 +675,7 @@ async def _retrieve_subscription_for_sync(
         return lock_token, reconcile_sequence, {
             "id": subscription_id,
             "customer": customer_id,
+            "created": int(binding.get("stripe_subscription_created") or 0),
             "status": "canceled",
             "ended_at": int(time.time()),
             "items": {
@@ -686,7 +692,9 @@ async def _retrieve_subscription_for_sync(
         }
     except Exception:
         try:
-            await _finish_reconcile_lease(rest_request, subscription_id, lock_token)
+            await _finish_reconcile_lease(
+                rest_request, subscription_id, lock_token, reconcile_sequence
+            )
         except Exception:
             pass
         raise
@@ -720,6 +728,7 @@ async def _sync_subscription(
     subscription: dict[str, Any],
     *,
     reconcile_sequence: int,
+    lock_token: str,
     fallback_user_id: str | None = None,
 ) -> None:
     user_id, binding = await _resolve_webhook_user(rest_request, subscription, fallback_user_id)
@@ -755,6 +764,12 @@ async def _sync_subscription(
     )
     if not subscription_id or not customer_id:
         raise RuntimeError("Stripe subscription is missing its customer or subscription ID.")
+    try:
+        subscription_created = int(
+            subscription.get("created") or binding.get("stripe_subscription_created") or 0
+        )
+    except (TypeError, ValueError):
+        subscription_created = 0
 
     await _billing_rpc(
         rest_request,
@@ -766,6 +781,7 @@ async def _sync_subscription(
             "p_status": status or "unknown",
             "p_customer_id": customer_id,
             "p_subscription_id": subscription_id,
+            "p_subscription_created": subscription_created,
             "p_price_id": bound_price_id,
             "p_currency": currency,
             "p_period_start": current_period_start,
@@ -776,6 +792,7 @@ async def _sync_subscription(
             "p_latest_invoice_id": _clean_stripe_id(subscription.get("latest_invoice")),
             "p_event_created": int(event.get("created") or 0),
             "p_reconcile_sequence": reconcile_sequence,
+            "p_lock_token": lock_token,
         },
     )
 
@@ -803,24 +820,33 @@ async def _sync_subscription_with_lease(
             event,
             subscription,
             reconcile_sequence=reconcile_sequence,
+            lock_token=lock_token,
             fallback_user_id=fallback_user_id,
         )
-    finally:
+    except Exception:
+        # A successful sync consumes its lease atomically in PostgreSQL. If the
+        # sync transaction rolls back, release the restored lease so a Stripe
+        # retry can claim it immediately instead of waiting for expiration.
         try:
-            await _finish_reconcile_lease(rest_request, subscription_id, lock_token)
+            await _finish_reconcile_lease(
+                rest_request, subscription_id, lock_token, reconcile_sequence
+            )
         except Exception:
-            # The lease is short-lived and is only an ordering guard. Do not
-            # conceal a successful entitlement sync or the original error.
             pass
+        raise
 
 
-async def _claim_event(rest_request: Callable[..., Any], event: dict[str, Any]) -> str:
+async def _claim_event(
+    rest_request: Callable[..., Any], event: dict[str, Any]
+) -> tuple[str, str]:
+    processing_token = os.urandom(32).hex()
     result = await _billing_rpc(
         rest_request,
         "claim_lj_billing_webhook_event_v2",
         {
             "p_event_id": str(event.get("id") or ""),
             "p_event_type": str(event.get("type") or ""),
+            "p_processing_token": processing_token,
             "p_stripe_created_at": int(event.get("created") or 0),
         },
     )
@@ -830,20 +856,29 @@ async def _claim_event(rest_request: Callable[..., Any], event: dict[str, Any]) 
     normalised = str(state or "").strip().upper()
     if normalised not in {"CLAIMED", "PROCESSED", "BUSY"}:
         raise RuntimeError("Billing event claim returned an invalid state.")
-    return normalised
+    return normalised, processing_token
 
 
 async def _finish_event(
     rest_request: Callable[..., Any],
     event_id: str,
+    processing_token: str,
     *,
     error: str | None = None,
 ) -> None:
     function = "fail_lj_billing_webhook_event" if error else "complete_lj_billing_webhook_event"
-    payload: dict[str, Any] = {"p_event_id": event_id}
+    payload: dict[str, Any] = {
+        "p_event_id": event_id,
+        "p_processing_token": processing_token,
+    }
     if error:
         payload["p_error"] = error[:500]
-    await _billing_rpc(rest_request, function, payload)
+    result = await _billing_rpc(rest_request, function, payload)
+    value = result[0] if isinstance(result, list) and result else result
+    if isinstance(value, dict):
+        value = next(iter(value.values()), False)
+    if value is not True:
+        raise RuntimeError("Billing event claim was lost before completion.")
 
 
 async def _handle_webhook_event(rest_request: Callable[..., Any], event: dict[str, Any]) -> None:
@@ -906,6 +941,7 @@ async def _handle_webhook_event(rest_request: Callable[..., Any], event: dict[st
         synthetic = {
             "id": binding["stripe_subscription_id"],
             "customer": customer_id,
+            "created": int(binding.get("stripe_subscription_created") or 0),
             "status": "canceled",
             "items": {
                 "data": [
@@ -1410,7 +1446,7 @@ def create_billing_router(
         if not isinstance(event, dict) or not str(event.get("id") or "").startswith("evt_"):
             raise HTTPException(status_code=400, detail="Stripe webhook event ID is missing.")
         event_id = str(event["id"])
-        claimed = await _claim_event(rest_request, event)
+        claimed, processing_token = await _claim_event(rest_request, event)
         if claimed == "PROCESSED":
             # This exact Event already committed successfully.
             return {"received": True}
@@ -1420,10 +1456,15 @@ def create_billing_router(
             raise HTTPException(status_code=503, detail="Stripe event is still being processed.")
         try:
             await _handle_webhook_event(rest_request, event)
-            await _finish_event(rest_request, event_id)
+            await _finish_event(rest_request, event_id, processing_token)
         except Exception as exc:
             try:
-                await _finish_event(rest_request, event_id, error=type(exc).__name__)
+                await _finish_event(
+                    rest_request,
+                    event_id,
+                    processing_token,
+                    error=type(exc).__name__,
+                )
             except Exception:
                 pass
             if isinstance(exc, HTTPException):
