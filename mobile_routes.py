@@ -1,6 +1,6 @@
-"""Staged LJ AI phone-to-Windows routes.
+"""Production LJ AI phone-to-Windows routes.
 
-Copy beside the cloud main.py and include only after running the staging SQL and
+Keep beside the cloud main.py and enable after applying the production SQL and
 setting LJ_PAIRING_HMAC_SECRET to at least 32 random characters. This module
 never accepts arbitrary commands or shell text.
 """
@@ -15,13 +15,32 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from mobile_security import ALLOWED_ACTIONS, is_valid_pairing_code, normalize_pairing_code, pairing_digest
+from mobile_security import (
+    ALLOWED_ACTIONS,
+    PairingConfigurationError,
+    is_valid_pairing_code,
+    normalize_pairing_code,
+    pairing_digest,
+    sanitize_remote_command_payload,
+)
 
 
 PAIRING_TTL_SECONDS = 300
 COMMAND_TTL_SECONDS = 45
+
+
+def _pairing_code_digest(user_id: str, code: str) -> str:
+    """Hash a pairing code without leaking server configuration details."""
+
+    try:
+        return pairing_digest(user_id, code, os.getenv("LJ_PAIRING_HMAC_SECRET", ""))
+    except PairingConfigurationError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Phone-to-PC pairing is temporarily unavailable.",
+        ) from error
 
 
 class PairingClaim(BaseModel):
@@ -55,6 +74,11 @@ class RemoteCommandRequest(BaseModel):
         if len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > 4096:
             raise ValueError("Remote command details are too large.")
         return value
+
+    @model_validator(mode="after")
+    def action_specific_payload(self) -> "RemoteCommandRequest":
+        self.payload = sanitize_remote_command_payload(self.action, self.payload)
+        return self
 
 
 class CommandResult(BaseModel):
@@ -94,7 +118,6 @@ def create_mobile_router(
         device = await current_device(identity)
         if not str(device.get("platform") or "").casefold().startswith("windows"):
             raise HTTPException(status_code=403, detail="Pairing codes must be created by LJ AI on Windows.")
-        secret = os.getenv("LJ_PAIRING_HMAC_SECRET", "")
         code = f"{secrets.randbelow(1_000_000):06d}"
         now = datetime.now(timezone.utc)
         expires = now + timedelta(seconds=PAIRING_TTL_SECONDS)
@@ -105,7 +128,7 @@ def create_mobile_router(
                 "user_id": identity.user_id,
                 "windows_device_id": identity.device_id,
                 "windows_device_name": str(device.get("device_name") or "Windows PC")[:80],
-                "code_hash": pairing_digest(identity.user_id, code, secret),
+                "code_hash": _pairing_code_digest(identity.user_id, code),
                 "expires_at": expires.isoformat(),
             },
             prefer="return=minimal",
@@ -123,12 +146,11 @@ def create_mobile_router(
         device = await current_device(identity)
         if not str(device.get("platform") or "").casefold().startswith("android"):
             raise HTTPException(status_code=403, detail="Use LJ AI Mobile on Android to claim this code.")
-        secret = os.getenv("LJ_PAIRING_HMAC_SECRET", "")
         result = await rpc(
             "claim_lj_pairing_code",
             {
                 "p_user_id": identity.user_id,
-                "p_code_hash": pairing_digest(identity.user_id, body.code, secret),
+                "p_code_hash": _pairing_code_digest(identity.user_id, body.code),
                 "p_mobile_device_id": identity.device_id,
                 "p_mobile_device_name": body.mobile_device_name,
             },
@@ -237,12 +259,20 @@ def create_mobile_router(
         row = rows[0]
         if row.get("status") in {"PENDING", "DELIVERED"}:
             expiry = datetime.fromisoformat(str(row.get("expires_at") or "").replace("Z", "+00:00"))
-            if expiry <= datetime.now(timezone.utc):
+            now = datetime.now(timezone.utc)
+            if expiry <= now:
                 await rest_request(
                     "PATCH",
                     "device_remote_commands",
-                    params={"id": f"eq.{command_id}", "status": "in.(PENDING,DELIVERED)"},
-                    payload={"status": "EXPIRED", "completed_at": datetime.now(timezone.utc).isoformat()},
+                    params={
+                        "id": f"eq.{command_id}",
+                        "link_id": f"eq.{link_id}",
+                        "user_id": f"eq.{identity.user_id}",
+                        "source_device_id": f"eq.{identity.device_id}",
+                        "status": "in.(PENDING,DELIVERED)",
+                        "expires_at": f"lte.{now.isoformat()}",
+                    },
+                    payload={"status": "EXPIRED", "completed_at": now.isoformat()},
                     prefer="return=minimal",
                 )
                 row["status"] = "EXPIRED"
@@ -274,7 +304,13 @@ def create_mobile_router(
             await rest_request(
                 "PATCH",
                 "device_remote_commands",
-                params={"id": f"in.({ids})", "status": "eq.PENDING"},
+                params={
+                    "id": f"in.({ids})",
+                    "user_id": f"eq.{identity.user_id}",
+                    "target_device_id": f"eq.{identity.device_id}",
+                    "status": "eq.PENDING",
+                    "expires_at": f"gt.{datetime.now(timezone.utc).isoformat()}",
+                },
                 payload={"status": "DELIVERED", "delivered_at": datetime.now(timezone.utc).isoformat()},
                 prefer="return=minimal",
             )
@@ -300,24 +336,40 @@ def create_mobile_router(
                 "target_device_id": f"eq.{identity.device_id}",
                 "status": "in.(PENDING,DELIVERED)",
                 "expires_at": f"gt.{datetime.now(timezone.utc).isoformat()}",
-                "select": "id,link_id,action",
+                "select": "id,link_id,action,source_device_id",
                 "limit": "1",
             },
         ) or []
         if not rows:
             raise HTTPException(status_code=404, detail="That remote command is unavailable or already completed.")
         now = datetime.now(timezone.utc).isoformat()
-        await rest_request(
+        updated = await rest_request(
             "PATCH",
             "device_remote_commands",
-            params={"id": f"eq.{command_id}"},
+            params={
+                "id": f"eq.{command_id}",
+                "link_id": f"eq.{rows[0]['link_id']}",
+                "user_id": f"eq.{identity.user_id}",
+                "source_device_id": f"eq.{rows[0]['source_device_id']}",
+                "target_device_id": f"eq.{identity.device_id}",
+                "status": "in.(PENDING,DELIVERED)",
+                "expires_at": f"gt.{now}",
+            },
             payload={"status": body.status, "result": {"message": body.message}, "completed_at": now},
-            prefer="return=minimal",
+            prefer="return=representation",
         )
+        if not updated:
+            raise HTTPException(status_code=409, detail="That remote command was already completed or expired.")
         await rest_request(
             "PATCH",
             "device_links",
-            params={"id": f"eq.{rows[0]['link_id']}"},
+            params={
+                "id": f"eq.{rows[0]['link_id']}",
+                "user_id": f"eq.{identity.user_id}",
+                "windows_device_id": f"eq.{identity.device_id}",
+                "mobile_device_id": f"eq.{rows[0]['source_device_id']}",
+                "is_active": "eq.true",
+            },
             payload={"last_used_at": now},
             prefer="return=minimal",
         )

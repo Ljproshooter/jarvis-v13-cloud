@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: lj-ai-mobile-staging
+    name: jarvis-v13-cloud
     runtime: python
     plan: free
     autoDeploy: true
@@ -36,6 +36,8 @@ services:
         value: gpt-5.6-luna
       - key: OPENAI_IMAGE_MODEL
         value: gpt-5.6
+      - key: OPENAI_IMAGE_TOOL_MODEL
+        value: gpt-image-2
       - key: OPENAI_TEXT_FAST_MODEL
         value: gpt-5.6-luna
       - key: OPENAI_TEXT_SERVICE_TIER
@@ -50,16 +52,24 @@ services:
         value: cedar
       - key: REQUEST_TIMEOUT_SECONDS
         value: "75"
+      - key: IMAGE_REQUEST_TIMEOUT_SECONDS
+        value: "240"
       - key: MAX_AUDIO_BYTES
         value: "15728640"
       - key: ALLOWED_ORIGINS
         sync: false
+      - key: PASSWORD_RESET_REDIRECT_URL
+        value: https://jarvis-v13-cloud.onrender.com/v1/auth/password-reset/complete
+      - key: EMAIL_VERIFICATION_REDIRECT_URL
+        value: https://jarvis-v13-cloud.onrender.com/v1/auth/email-verification/complete
       - key: PAYPAL_CHECKOUT_URL
         sync: false
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
+      - key: STRIPE_DEFAULT_CURRENCY
+        value: USD
       - key: STRIPE_PRICE_BASIC_MONTHLY
         sync: false
       - key: STRIPE_PRICE_BASIC_3_MONTHS
@@ -78,18 +88,32 @@ services:
         sync: false
       - key: STRIPE_PRICE_VIP_YEARLY
         sync: false
+      - key: STRIPE_PRICE_MAP_JSON
+        sync: false
+      - key: STRIPE_ENABLE_ADAPTIVE_PRICING
+        value: "true"
+      - key: STRIPE_ENABLE_AUTOMATIC_TAX
+        value: "false"
+      - key: STRIPE_ALLOW_PROMOTION_CODES
+        value: "false"
+      - key: STRIPE_WEBHOOK_TOLERANCE_SECONDS
+        value: "300"
+      - key: STRIPE_API_VERSION
+        sync: false
+      - key: STRIPE_PORTAL_CONFIGURATION_ID
+        sync: false
       - key: STRIPE_SUCCESS_URL
-        value: "https://lj-ai-mobile-staging.onrender.com/v1/billing/success?session_id={CHECKOUT_SESSION_ID}"
+        value: "https://jarvis-v13-cloud.onrender.com/v1/billing/success?session_id={CHECKOUT_SESSION_ID}"
       - key: STRIPE_CANCEL_URL
-        value: https://lj-ai-mobile-staging.onrender.com/v1/billing/cancel
+        value: https://jarvis-v13-cloud.onrender.com/v1/billing/cancel
       - key: STRIPE_PORTAL_RETURN_URL
-        value: https://lj-ai-mobile-staging.onrender.com/v1/billing/success
+        value: https://lj-ai-official-site.pages.dev/
       - key: SMARTTHINGS_CLIENT_ID
         sync: false
       - key: SMARTTHINGS_CLIENT_SECRET
         sync: false
       - key: SMARTTHINGS_REDIRECT_URI
-        value: https://lj-ai-mobile-staging.onrender.com/v1/smartthings/oauth/callback
+        value: https://jarvis-v13-cloud.onrender.com/v1/smartthings/oauth/callback
       - key: SMARTTHINGS_TOKEN_ENCRYPTION_KEY
         sync: false
       - key: SMARTTHINGS_SCOPES

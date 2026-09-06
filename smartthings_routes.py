@@ -1,4 +1,4 @@
-"""Staged SmartThings OAuth and allowlisted device/scene controls.
+"""Production SmartThings OAuth and allowlisted device/scene controls.
 
 Samsung credentials and tokens stay on the server. The Android app receives
 only LJ AI responses and never the SmartThings client secret or access token.
