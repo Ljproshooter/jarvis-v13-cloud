@@ -124,13 +124,18 @@ class BillingWebhookTests(unittest.IsolatedAsyncioTestCase):
             clear=True,
         ):
             await billing._sync_subscription(
-                rest_request, event, subscription, reconcile_sequence=17
+                rest_request,
+                event,
+                subscription,
+                reconcile_sequence=17,
+                lock_token="a" * 64,
             )
 
         self.assertEqual(sync_payload["p_plan_key"], "BASIC")
         self.assertEqual(sync_payload["p_billing_period"], "MONTHLY")
         self.assertEqual(sync_payload["p_user_id"], user_id)
         self.assertEqual(sync_payload["p_reconcile_sequence"], 17)
+        self.assertEqual(sync_payload["p_lock_token"], "a" * 64)
 
     async def test_unconfigured_price_cannot_activate_metadata_plan(self) -> None:
         user_id = "00000000-0000-4000-8000-000000000123"
@@ -170,7 +175,11 @@ class BillingWebhookTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RuntimeError):
                 await billing._sync_subscription(
-                    rest_request, event, subscription, reconcile_sequence=18
+                    rest_request,
+                    event,
+                    subscription,
+                    reconcile_sequence=18,
+                    lock_token="b" * 64,
                 )
 
     def test_subscription_requires_one_item_at_quantity_one(self) -> None:
@@ -273,7 +282,7 @@ class BillingWebhookTests(unittest.IsolatedAsyncioTestCase):
             await billing._claim_reconcile_lease(rest_request, "sub_test")
         self.assertEqual(raised.exception.status_code, 503)
 
-    async def test_reconcile_lease_wraps_entitlement_sync(self) -> None:
+    async def test_successful_reconcile_consumes_lease_atomically_in_sync(self) -> None:
         calls: list[str] = []
 
         async def rest_request(*_args, **_kwargs):
@@ -284,16 +293,24 @@ class BillingWebhookTests(unittest.IsolatedAsyncioTestCase):
             calls.append("claim-and-fetch")
             return "a" * 64, 51, {"id": "sub_test", "customer": "cus_test"}
 
-        async def sync(_rest, event, subscription, *, reconcile_sequence, fallback_user_id=None):
+        async def sync(
+            _rest,
+            event,
+            subscription,
+            *,
+            reconcile_sequence,
+            lock_token,
+            fallback_user_id=None,
+        ):
             self.assertEqual(event["id"], "evt_test")
             self.assertEqual(subscription["id"], "sub_test")
             self.assertEqual(reconcile_sequence, 51)
+            self.assertEqual(lock_token, "a" * 64)
             self.assertIsNone(fallback_user_id)
             calls.append("sync")
 
-        async def finish(_rest, subscription_id, token):
-            self.assertEqual((subscription_id, token), ("sub_test", "a" * 64))
-            calls.append("release")
+        async def finish(*_args, **_kwargs):
+            raise AssertionError("a successful atomic sync must consume, not release, its lease")
 
         with (
             patch.object(billing, "_retrieve_subscription_for_sync", retrieve),
@@ -305,7 +322,7 @@ class BillingWebhookTests(unittest.IsolatedAsyncioTestCase):
                 {"id": "evt_test", "type": "invoice.paid"},
                 "sub_test",
             )
-        self.assertEqual(calls, ["claim-and-fetch", "sync", "release"])
+        self.assertEqual(calls, ["claim-and-fetch", "sync"])
 
     async def test_webhook_never_grants_from_unbound_metadata(self) -> None:
         async def rest_request(method: str, path: str, **_kwargs):

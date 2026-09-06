@@ -134,3 +134,13 @@ services:
         sync: false
       - key: CLIENT_UPDATE_NOTES
         sync: false
+      - key: ANDROID_LATEST_VERSION_NAME
+        sync: false
+      - key: ANDROID_LATEST_VERSION_CODE
+        sync: false
+      - key: ANDROID_UPDATE_URL
+        sync: false
+      - key: ANDROID_UPDATE_SHA256
+        sync: false
+      - key: ANDROID_UPDATE_NOTES
+        sync: false

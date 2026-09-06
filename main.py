@@ -109,6 +109,11 @@ CLIENT_INSTALLER_SOURCE_URL = (
     "https://github.com/Ljproshooter/jarvis-v13-cloud/"
     "releases/latest/download/LJ_AI_Setup.exe"
 )
+ANDROID_LATEST_VERSION_NAME = os.getenv("ANDROID_LATEST_VERSION_NAME", APP_VERSION).strip()
+ANDROID_LATEST_VERSION_CODE = os.getenv("ANDROID_LATEST_VERSION_CODE", "").strip()
+ANDROID_UPDATE_URL = os.getenv("ANDROID_UPDATE_URL", "").strip()
+ANDROID_UPDATE_SHA256 = os.getenv("ANDROID_UPDATE_SHA256", "").strip().lower()
+ANDROID_UPDATE_NOTES = os.getenv("ANDROID_UPDATE_NOTES", "LJ AI Mobile is up to date.").strip()
 
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "75"))
 IMAGE_REQUEST_TIMEOUT_SECONDS = float(os.getenv("IMAGE_REQUEST_TIMEOUT_SECONDS", "240"))
@@ -1385,6 +1390,66 @@ async def client_update() -> JSONResponse:
         "sha256": CLIENT_UPDATE_SHA256 if re.fullmatch(r"[0-9a-f]{64}", CLIENT_UPDATE_SHA256) else "",
         "notes": CLIENT_UPDATE_NOTES[:2000],
     }, headers={"Cache-Control": "no-store, max-age=0"})
+
+
+def _trusted_android_release_url(value: str) -> bool:
+    """Only advertise versioned APKs from LJ AI's public GitHub releases."""
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname == "github.com"
+        and port is None
+        and not parsed.username
+        and not parsed.password
+        and parsed.path.startswith(
+            "/Ljproshooter/jarvis-v13-cloud/releases/download/"
+        )
+        and parsed.path.endswith(".apk")
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+@app.get("/v1/mobile/update")
+async def mobile_update(installed_code: int = 0) -> JSONResponse:
+    """Return verified direct-distribution Android release metadata.
+
+    The app independently requires a newer version code, HTTPS GitHub release
+    URL, matching SHA-256 and the same Android signing certificate before it
+    opens Android's normal, user-confirmed package installer.
+    """
+    try:
+        latest_code = int(ANDROID_LATEST_VERSION_CODE)
+    except (TypeError, ValueError):
+        latest_code = 0
+    version_name_valid = bool(
+        re.fullmatch(r"\d{1,4}\.\d{1,4}\.\d{1,4}", ANDROID_LATEST_VERSION_NAME)
+    )
+    sha_valid = bool(re.fullmatch(r"[0-9a-f]{64}", ANDROID_UPDATE_SHA256))
+    url_valid = _trusted_android_release_url(ANDROID_UPDATE_URL)
+    configured = bool(
+        version_name_valid
+        and 0 < latest_code <= 2_100_000_000
+        and sha_valid
+        and url_valid
+    )
+    return JSONResponse(
+        content={
+            "configured": configured,
+            "available": configured and latest_code > max(0, installed_code),
+            "version_name": ANDROID_LATEST_VERSION_NAME if version_name_valid else "",
+            "version_code": latest_code if 0 < latest_code <= 2_100_000_000 else 0,
+            "download_url": ANDROID_UPDATE_URL if configured else "",
+            "sha256": ANDROID_UPDATE_SHA256 if configured else "",
+            "notes": ANDROID_UPDATE_NOTES[:2000],
+        },
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.get("/v1/client/download")

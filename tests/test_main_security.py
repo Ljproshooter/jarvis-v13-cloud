@@ -587,5 +587,69 @@ class OwnerRecoverySecurityTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class MobileUpdateMetadataTests(unittest.IsolatedAsyncioTestCase):
+    async def test_complete_newer_android_release_is_advertised(self) -> None:
+        with (
+            patch.object(main, "ANDROID_LATEST_VERSION_NAME", "15.9.6"),
+            patch.object(main, "ANDROID_LATEST_VERSION_CODE", "15907"),
+            patch.object(
+                main,
+                "ANDROID_UPDATE_URL",
+                "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.6/LJ_AI_Mobile_V15.9.6.apk",
+            ),
+            patch.object(main, "ANDROID_UPDATE_SHA256", "a" * 64),
+            patch.object(main, "ANDROID_UPDATE_NOTES", "Verified Android update."),
+        ):
+            response = await main.mobile_update(installed_code=15906)
+
+        payload = json.loads(response.body)
+        self.assertTrue(payload["configured"])
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["version_code"], 15907)
+        self.assertEqual(response.headers["cache-control"], "no-store, max-age=0")
+
+    async def test_android_update_is_not_offered_to_same_or_newer_install(self) -> None:
+        with (
+            patch.object(main, "ANDROID_LATEST_VERSION_NAME", "15.9.5"),
+            patch.object(main, "ANDROID_LATEST_VERSION_CODE", "15906"),
+            patch.object(
+                main,
+                "ANDROID_UPDATE_URL",
+                "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.5/LJ_AI_Mobile_V15.9.5.apk",
+            ),
+            patch.object(main, "ANDROID_UPDATE_SHA256", "b" * 64),
+        ):
+            response = await main.mobile_update(installed_code=15906)
+
+        payload = json.loads(response.body)
+        self.assertTrue(payload["configured"])
+        self.assertFalse(payload["available"])
+
+    async def test_untrusted_or_incomplete_android_metadata_fails_closed(self) -> None:
+        with (
+            patch.object(main, "ANDROID_LATEST_VERSION_NAME", "15.9.6"),
+            patch.object(main, "ANDROID_LATEST_VERSION_CODE", "15907"),
+            patch.object(main, "ANDROID_UPDATE_URL", "https://example.com/update.apk"),
+            patch.object(main, "ANDROID_UPDATE_SHA256", "not-a-checksum"),
+        ):
+            response = await main.mobile_update(installed_code=15906)
+
+        payload = json.loads(response.body)
+        self.assertFalse(payload["configured"])
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["download_url"], "")
+        self.assertEqual(payload["sha256"], "")
+
+    def test_android_release_url_rejects_lookalikes(self) -> None:
+        self.assertTrue(
+            main._trusted_android_release_url(
+                "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.5/LJ_AI_Mobile_V15.9.5.apk"
+            )
+        )
+        self.assertFalse(main._trusted_android_release_url("http://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.5/app.apk"))
+        self.assertFalse(main._trusted_android_release_url("https://github.com.evil.example/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.5/app.apk"))
+        self.assertFalse(main._trusted_android_release_url("https://github.com/other/repo/releases/download/v15.9.5/app.apk"))
+
+
 if __name__ == "__main__":
     unittest.main()
