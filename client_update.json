@@ -1,6 +1,6 @@
 {
-    "version":  "15.9.4",
-    "download_url":  "https://jarvis-v13-cloud.onrender.com/v1/client/download",
-    "sha256":  "39b22c023aaaa3db76db904431fdb3f4b548feb65441399ecdc8f962833c4597",
-    "notes":  "LJ AI V15.9.4 adds real open-and-copy chat links, the official transparent LJ AI logo and crisp navigation icons, and separate ticket reply and close actions while preserving persistent login, mouse control and all existing features."
+  "version": "15.9.5",
+  "download_url": "https://jarvis-v13-cloud.onrender.com/v1/client/download",
+  "sha256": "6088c386ecdd06caac021c678a37c9763ed77dcd2596af62ade290f18696de57",
+  "notes": "LJ AI V15.9.5 adds Teach LJ Skills, live Stripe billing, stronger account security, improved platform-aware chat and voice, safer Android device controls, and verified in-app updates for Windows and Android."
 }
