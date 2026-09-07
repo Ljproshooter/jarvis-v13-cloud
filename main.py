@@ -3178,7 +3178,6 @@ async def realtime_token(
                     "and SHOW opens My Skills. Running, editing, duplicating or deleting a Skill must remain in the visible Skills UI. "
                     "Use an empty name for START, STOP and SHOW."
                 ),
-                "strict": True,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3321,7 +3320,6 @@ async def realtime_token(
                         "SHOW_NOTIFICATIONS only expands the shade and does not read or transmit its contents. ENABLE_NOTIFICATION_SHADE_ACCESS opens Android Accessibility settings. "
                         "Use GET_CAPABILITIES when support or permission state is uncertain. Use empty strings for fields irrelevant to the selected action."
                     ),
-                    "strict": True,
                     "parameters": {
                         "type": "object",
                         "properties": {
