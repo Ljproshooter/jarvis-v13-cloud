@@ -121,6 +121,14 @@ ANDROID_UPDATE_NOTES = os.getenv("ANDROID_UPDATE_NOTES", "LJ AI Mobile is up to 
 
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "75"))
 IMAGE_REQUEST_TIMEOUT_SECONDS = float(os.getenv("IMAGE_REQUEST_TIMEOUT_SECONDS", "240"))
+OPENAI_BACKGROUND_TIMEOUT_SECONDS = min(
+    600.0,
+    max(60.0, float(os.getenv("OPENAI_BACKGROUND_TIMEOUT_SECONDS", "360"))),
+)
+OPENAI_BACKGROUND_POLL_SECONDS = min(
+    10.0,
+    max(0.5, float(os.getenv("OPENAI_BACKGROUND_POLL_SECONDS", "2"))),
+)
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(15 * 1024 * 1024)))
 MAX_CLIENT_INSTALLER_BYTES = 200 * 1024 * 1024
 MAX_HISTORY_TURNS = 20
@@ -2774,21 +2782,45 @@ def _ensure_requested_links(message: str, reply: str, data: dict[str, Any]) -> s
     return sanitised_reply.rstrip() + f"\n\n{heading}:\n" + "\n".join(urls)
 
 
-async def _openai_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def _openai_request_json(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     _require_configuration()
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
     client = _shared_http_client()
     has_image_tool = any(
         isinstance(tool, dict) and tool.get("type") == "image_generation"
-        for tool in payload.get("tools") or []
+        for tool in (payload or {}).get("tools") or []
     )
+    request_timeout = timeout_seconds
+    if request_timeout is None:
+        request_timeout = IMAGE_REQUEST_TIMEOUT_SECONDS if has_image_tool else REQUEST_TIMEOUT_SECONDS
     try:
-        response = await client.post(
+        response = await client.request(
+            method.upper(),
             f"https://api.openai.com/v1/{path.lstrip('/')}",
             headers=headers,
-            json=payload,
-            timeout=IMAGE_REQUEST_TIMEOUT_SECONDS if has_image_tool else REQUEST_TIMEOUT_SECONDS,
+            json=payload if payload is not None else None,
+            timeout=request_timeout,
         )
+    except httpx.ReadTimeout as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="The AI response exceeded the per-request time limit.",
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="The AI service connection timed out. Please try again.",
+        ) from exc
     except httpx.RequestError as exc:
         raise HTTPException(status_code=503, detail="The AI service is currently unreachable.") from exc
     if response.status_code >= 400:
@@ -2796,7 +2828,85 @@ async def _openai_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         if response.status_code == 429:
             raise HTTPException(status_code=429, detail="The AI service is busy or has reached its usage limit.")
         raise HTTPException(status_code=502, detail=message)
-    return response.json()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="The AI service returned an unreadable response.") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="The AI service returned an invalid response.")
+    return data
+
+
+async def _openai_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Compatibility wrapper for ordinary synchronous Responses API calls."""
+    return await _openai_request_json("POST", path, payload)
+
+
+def _validated_openai_response_id(value: Any) -> str:
+    response_id = str(value or "").strip()
+    if not re.fullmatch(r"resp_[A-Za-z0-9_-]{8,200}", response_id):
+        raise HTTPException(status_code=502, detail="The AI service returned an invalid job reference.")
+    return response_id
+
+
+async def _cancel_openai_background_response(response_id: str) -> None:
+    """Best-effort cancellation prevents an abandoned maximum-reasoning job running forever."""
+    try:
+        await _openai_request_json(
+            "POST",
+            f"responses/{response_id}/cancel",
+            timeout_seconds=min(10.0, REQUEST_TIMEOUT_SECONDS),
+        )
+    except HTTPException:
+        pass
+
+
+async def _openai_background_json(payload: dict[str, Any], mode_label: str) -> dict[str, Any]:
+    """Run long reasoning in OpenAI Background Mode and poll until it is ready."""
+    background_payload = dict(payload)
+    background_payload["background"] = True
+    data = await _openai_json("responses", background_payload)
+    status_value = str(data.get("status") or "").strip().casefold()
+    if status_value == "completed" or (not status_value and _extract_response_text(data)):
+        return data
+
+    response_id = _validated_openai_response_id(data.get("id"))
+    deadline = time.monotonic() + OPENAI_BACKGROUND_TIMEOUT_SECONDS
+    consecutive_poll_errors = 0
+    while status_value in {"queued", "in_progress"}:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            await _cancel_openai_background_response(response_id)
+            minutes = max(1, round(OPENAI_BACKGROUND_TIMEOUT_SECONDS / 60))
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"{mode_label} was still working after {minutes} minutes. "
+                    "Try splitting the project into two smaller requests."
+                ),
+            )
+        await asyncio.sleep(min(OPENAI_BACKGROUND_POLL_SECONDS, remaining))
+        try:
+            data = await _openai_request_json("GET", f"responses/{response_id}")
+            consecutive_poll_errors = 0
+        except HTTPException as error:
+            consecutive_poll_errors += 1
+            if error.status_code in {503, 504} and consecutive_poll_errors < 3:
+                continue
+            raise
+        status_value = str(data.get("status") or "").strip().casefold()
+
+    # An incomplete response can still contain a useful answer (for example,
+    # if it reached its output-token cap), so return it instead of discarding it.
+    if status_value in {"completed", "incomplete"} and _extract_response_text(data):
+        return data
+    if status_value == "cancelled":
+        detail = f"{mode_label} was cancelled before it finished. Please try again."
+    elif status_value == "failed":
+        detail = f"{mode_label} could not finish this request. Please try again or split it into smaller parts."
+    else:
+        detail = f"{mode_label} ended without a completed answer. Please try again."
+    raise HTTPException(status_code=502, detail=detail)
 
 
 async def _record_api_usage(
@@ -3030,7 +3140,6 @@ async def chat(
     else:
         payload["text"] = {"verbosity": response_verbosity}
         payload["reasoning"] = {"effort": reasoning_effort}
-    if not body.from_voice and ai_mode == "NORMAL" and identity.effective_plan == "FREE":
         if OPENAI_TEXT_SERVICE_TIER == "fast":
             payload["service_tier"] = "fast"
 
@@ -3048,8 +3157,6 @@ async def chat(
         payload["tools"] = [{"type": "web_search"}]
         payload["reasoning"] = {"effort": reasoning_effort}
         payload["text"] = {"verbosity": response_verbosity}
-        if ai_mode == "NORMAL" and OPENAI_TEXT_SERVICE_TIER == "fast":
-            payload["service_tier"] = "fast"
         payload["instructions"] += (
             "\nThe user explicitly requested current public web information or supplied a public link. "
             "Always use web search before answering. For weather, give the requested days and location. "
@@ -3058,7 +3165,10 @@ async def chat(
             "Keep voice answers easy to listen to and state when a page blocks access. Never access private/local addresses or authenticated accounts."
         )
 
-    data = await _openai_json("responses", payload)
+    if not body.from_voice and ai_mode in {"DEEP_THINK", "DEVELOPER"}:
+        data = await _openai_background_json(payload, AI_MODE_LABELS[ai_mode])
+    else:
+        data = await _openai_json("responses", payload)
     reply = _extract_response_text(data)
     if not reply:
         raise HTTPException(status_code=502, detail="The AI returned an empty response.")

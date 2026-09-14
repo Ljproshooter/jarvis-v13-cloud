@@ -62,6 +62,10 @@ services:
         value: "75"
       - key: IMAGE_REQUEST_TIMEOUT_SECONDS
         value: "240"
+      - key: OPENAI_BACKGROUND_TIMEOUT_SECONDS
+        value: "360"
+      - key: OPENAI_BACKGROUND_POLL_SECONDS
+        value: "2"
       - key: MAX_AUDIO_BYTES
         value: "15728640"
       - key: ALLOWED_ORIGINS
