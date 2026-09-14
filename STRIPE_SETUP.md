@@ -1,4 +1,4 @@
-# LJ AI V15.9.5 Stripe Billing setup
+# LJ AI V15.9.6 Stripe Billing setup
 
 Use Stripe test mode first. Do not enter live keys until a complete test purchase,
 renewal, cancellation, and failed-payment test all behave correctly.
@@ -15,7 +15,7 @@ and run the complete updated contents of:
 
 `LJ_AI_STRIPE_BILLING_UPDATE.sql`
 
-Run it again even if an earlier copy was already applied; the V15.9.5 migration
+Run it again even if an earlier copy was already applied; the V15.9.6 migration
 contains the latest event-ordering, idempotency and pending-checkout safeguards.
 It is additive and safe to rerun. This must finish successfully before deploying
 the matching `billing_routes.py`.

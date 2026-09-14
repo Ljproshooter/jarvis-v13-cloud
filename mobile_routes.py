@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from mobile_security import (
     ALLOWED_ACTIONS,
+    ANDROID_ALLOWED_ACTIONS,
     PairingConfigurationError,
     is_valid_pairing_code,
     normalize_pairing_code,
@@ -65,6 +66,7 @@ class RemoteCommandRequest(BaseModel):
         "lock_pc",
         "open_lj_ai",
         "run_diagnostic",
+        "open_app",
     ]
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -374,6 +376,219 @@ def create_mobile_router(
             prefer="return=minimal",
         )
         await insert_audit(identity.user_id, "PC_COMMAND_COMPLETED", {"command_id": command_id, "status": body.status})
+        return {"completed": True}
+
+    @router.post("/device-links/{link_id}/commands", status_code=202)
+    async def enqueue_device_command(
+        link_id: str,
+        body: RemoteCommandRequest,
+        identity: Any = Depends(current_identity),
+    ) -> dict[str, Any]:
+        """Queue one bounded command from either endpoint of an approved pair."""
+
+        await limiter.enforce(f"device-command:{identity.user_id}:{identity.device_id}", 30, 60)
+        try:
+            link_id = str(uuid.UUID(link_id))
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=404, detail="That device link is unavailable.") from None
+        rows = await rest_request(
+            "GET",
+            "device_links",
+            params={
+                "id": f"eq.{link_id}",
+                "user_id": f"eq.{identity.user_id}",
+                "is_active": "eq.true",
+                "select": "id,windows_device_id,mobile_device_id",
+                "limit": "1",
+            },
+        ) or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="That device link is not active.")
+        link = rows[0]
+        if identity.device_id == link.get("windows_device_id"):
+            target_device_id = str(link.get("mobile_device_id") or "")
+            target_actions = ANDROID_ALLOWED_ACTIONS
+            target_name = "Android"
+        elif identity.device_id == link.get("mobile_device_id"):
+            target_device_id = str(link.get("windows_device_id") or "")
+            target_actions = ALLOWED_ACTIONS
+            target_name = "Windows"
+        else:
+            raise HTTPException(status_code=404, detail="That device link does not belong to this signed-in device.")
+        if body.action not in target_actions:
+            raise HTTPException(status_code=400, detail=f"That action is not available on the linked {target_name} device.")
+        now = datetime.now(timezone.utc)
+        created = await rest_request(
+            "POST",
+            "device_remote_commands",
+            payload={
+                "user_id": identity.user_id,
+                "link_id": link_id,
+                "source_device_id": identity.device_id,
+                "target_device_id": target_device_id,
+                "action": body.action,
+                "payload": body.payload,
+                "requires_pc_confirmation": target_actions[body.action],
+                "expires_at": (now + timedelta(seconds=COMMAND_TTL_SECONDS)).isoformat(),
+            },
+            prefer="return=representation",
+        ) or []
+        if not created:
+            raise HTTPException(status_code=502, detail="The paired-device command could not be queued.")
+        await insert_audit(
+            identity.user_id,
+            "DEVICE_COMMAND_QUEUED",
+            {"link_id": link_id, "action": body.action, "target": target_name.upper()},
+        )
+        return {
+            "command_id": created[0]["id"],
+            "status": "PENDING",
+            "target_platform": target_name.upper(),
+            "requires_target_confirmation": target_actions[body.action],
+        }
+
+    @router.get("/device-links/{link_id}/commands/{command_id}")
+    async def device_command_status(
+        link_id: str,
+        command_id: str,
+        identity: Any = Depends(current_identity),
+    ) -> dict[str, Any]:
+        await limiter.enforce(f"device-command-status:{identity.user_id}:{identity.device_id}", 60, 60)
+        try:
+            link_id = str(uuid.UUID(link_id))
+            command_id = str(uuid.UUID(command_id))
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=404, detail="That paired-device command is unavailable.") from None
+        rows = await rest_request(
+            "GET",
+            "device_remote_commands",
+            params={
+                "id": f"eq.{command_id}",
+                "link_id": f"eq.{link_id}",
+                "user_id": f"eq.{identity.user_id}",
+                "source_device_id": f"eq.{identity.device_id}",
+                "select": "id,status,result,expires_at",
+                "limit": "1",
+            },
+        ) or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="That paired-device command is unavailable.")
+        row = rows[0]
+        if row.get("status") in {"PENDING", "DELIVERED"}:
+            expiry = datetime.fromisoformat(str(row.get("expires_at") or "").replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            if expiry <= now:
+                await rest_request(
+                    "PATCH",
+                    "device_remote_commands",
+                    params={
+                        "id": f"eq.{command_id}",
+                        "user_id": f"eq.{identity.user_id}",
+                        "source_device_id": f"eq.{identity.device_id}",
+                        "status": "in.(PENDING,DELIVERED)",
+                    },
+                    payload={"status": "EXPIRED", "completed_at": now.isoformat()},
+                    prefer="return=minimal",
+                )
+                row["status"] = "EXPIRED"
+        result = row.get("result") if isinstance(row.get("result"), dict) else {}
+        return {
+            "command_id": command_id,
+            "status": row.get("status"),
+            "message": str(result.get("message") or "")[:500],
+        }
+
+    @router.get("/device-links/commands/pending")
+    async def pending_device_commands(identity: Any = Depends(current_identity)) -> list[dict[str, Any]]:
+        await limiter.enforce(f"device-poll:{identity.user_id}:{identity.device_id}", 120, 60)
+        now = datetime.now(timezone.utc).isoformat()
+        rows = await rest_request(
+            "GET",
+            "device_remote_commands",
+            params={
+                "user_id": f"eq.{identity.user_id}",
+                "target_device_id": f"eq.{identity.device_id}",
+                "status": "in.(PENDING,DELIVERED)",
+                "expires_at": f"gt.{now}",
+                "select": "id,link_id,action,payload,requires_pc_confirmation,created_at,expires_at",
+                "order": "created_at.asc",
+                "limit": "20",
+            },
+        ) or []
+        if rows:
+            ids = ",".join(str(row["id"]) for row in rows)
+            await rest_request(
+                "PATCH",
+                "device_remote_commands",
+                params={
+                    "id": f"in.({ids})",
+                    "user_id": f"eq.{identity.user_id}",
+                    "target_device_id": f"eq.{identity.device_id}",
+                    "status": "eq.PENDING",
+                    "expires_at": f"gt.{now}",
+                },
+                payload={"status": "DELIVERED", "delivered_at": now},
+                prefer="return=minimal",
+            )
+        return rows
+
+    @router.post("/device-links/commands/{command_id}/result")
+    async def complete_device_command(
+        command_id: str,
+        body: CommandResult,
+        identity: Any = Depends(current_identity),
+    ) -> dict[str, Any]:
+        await limiter.enforce(f"device-result:{identity.user_id}:{identity.device_id}", 120, 60)
+        try:
+            command_id = str(uuid.UUID(command_id))
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=404, detail="That paired-device command is unavailable.") from None
+        now = datetime.now(timezone.utc).isoformat()
+        rows = await rest_request(
+            "GET",
+            "device_remote_commands",
+            params={
+                "id": f"eq.{command_id}",
+                "user_id": f"eq.{identity.user_id}",
+                "target_device_id": f"eq.{identity.device_id}",
+                "status": "in.(PENDING,DELIVERED)",
+                "expires_at": f"gt.{now}",
+                "select": "id,link_id,source_device_id",
+                "limit": "1",
+            },
+        ) or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="That paired-device command is unavailable or already completed.")
+        row = rows[0]
+        updated = await rest_request(
+            "PATCH",
+            "device_remote_commands",
+            params={
+                "id": f"eq.{command_id}",
+                "link_id": f"eq.{row['link_id']}",
+                "user_id": f"eq.{identity.user_id}",
+                "source_device_id": f"eq.{row['source_device_id']}",
+                "target_device_id": f"eq.{identity.device_id}",
+                "status": "in.(PENDING,DELIVERED)",
+                "expires_at": f"gt.{now}",
+            },
+            payload={"status": body.status, "result": {"message": body.message}, "completed_at": now},
+            prefer="return=representation",
+        )
+        if not updated:
+            raise HTTPException(status_code=409, detail="That paired-device command was already completed or expired.")
+        await rest_request(
+            "PATCH",
+            "device_links",
+            params={"id": f"eq.{row['link_id']}", "user_id": f"eq.{identity.user_id}", "is_active": "eq.true"},
+            payload={"last_used_at": now},
+            prefer="return=minimal",
+        )
+        await insert_audit(
+            identity.user_id,
+            "DEVICE_COMMAND_COMPLETED",
+            {"command_id": command_id, "status": body.status},
+        )
         return {"completed": True}
 
     return router

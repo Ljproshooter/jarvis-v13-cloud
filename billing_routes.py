@@ -65,6 +65,7 @@ PLAN_CATALOG: dict[str, dict[str, Any]] = {
         "images": 3,
         "voice_seconds": 0,
         "refills": 0,
+        "ai_modes": ["NORMAL"],
     },
     "BASIC": {
         "name": "Basic",
@@ -73,6 +74,7 @@ PLAN_CATALOG: dict[str, dict[str, Any]] = {
         "images": {"MONTHLY": 60, "3_MONTHS": 180, "YEARLY": 730},
         "voice_seconds": {"MONTHLY": 5400, "3_MONTHS": 16200, "YEARLY": 74100},
         "refills": {"MONTHLY": 0, "3_MONTHS": 0, "YEARLY": 1},
+        "ai_modes": ["NORMAL"],
     },
     "PREMIUM": {
         "name": "Premium",
@@ -81,6 +83,7 @@ PLAN_CATALOG: dict[str, dict[str, Any]] = {
         "images": {"MONTHLY": 150, "3_MONTHS": 450, "YEARLY": 1825},
         "voice_seconds": {"MONTHLY": 18000, "3_MONTHS": 108000, "YEARLY": 219000},
         "refills": {"MONTHLY": 0, "3_MONTHS": 0, "YEARLY": 2},
+        "ai_modes": ["NORMAL", "SMART"],
     },
     "VIP": {
         "name": "VIP",
@@ -90,6 +93,8 @@ PLAN_CATALOG: dict[str, dict[str, Any]] = {
         "voice_seconds": {"MONTHLY": 36000, "3_MONTHS": 108000, "YEARLY": 438000},
         "refills": {"MONTHLY": 0, "3_MONTHS": 0, "YEARLY": 5},
         "three_month_refills_on_request": True,
+        "ai_modes": ["NORMAL", "SMART", "DEEP_THINK", "DEVELOPER"],
+        "max_reasoning": {"MONTHLY": 100, "3_MONTHS": 300, "YEARLY": 1200},
     },
 }
 
@@ -281,6 +286,8 @@ def public_plan_catalog() -> list[dict[str, Any]]:
                 "image_allowance": value["images"],
                 "voice_seconds": value["voice_seconds"],
                 "refills": value["refills"],
+                "ai_modes": value.get("ai_modes", ["NORMAL"]),
+                "max_reasoning_allowance": value.get("max_reasoning", 0),
                 "refill_on_request": bool(value.get("three_month_refills_on_request")),
                 "screen_monitoring": True,
                 "local_currency_at_checkout": True,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from typing import Any
 
 
@@ -16,11 +17,26 @@ ALLOWED_ACTIONS = {
     "lock_pc": True,
     "open_lj_ai": False,
     "run_diagnostic": True,
+    "open_app": False,
+}
+
+ANDROID_ALLOWED_ACTIONS = {
+    "open_lj_ai": False,
+    "open_app": False,
+    "media_play_pause": False,
+    "volume_mute": False,
 }
 
 NOTIFICATION_PAYLOAD_FIELDS = frozenset({"title", "message"})
 NOTIFICATION_TITLE_MAX_LENGTH = 100
 NOTIFICATION_MESSAGE_MAX_LENGTH = 500
+APP_NAME_MAX_LENGTH = 80
+SAFE_APP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+&'()-]{0,79}$")
+BLOCKED_APP_SUFFIXES = (".exe", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".msi", ".lnk")
+BLOCKED_COMMAND_HOSTS = {
+    "cmd", "command prompt", "powershell", "pwsh", "windows powershell",
+    "wscript", "cscript", "mshta", "rundll32", "regsvr32", "windows terminal",
+}
 
 
 class PairingConfigurationError(RuntimeError):
@@ -46,13 +62,31 @@ def pairing_digest(user_id: str, code: str, secret: str) -> str:
 def sanitize_remote_command_payload(action: str, payload: dict[str, Any]) -> dict[str, str]:
     """Return the small, action-specific payload that a Windows client may consume.
 
-    Every action except ``show_notification`` is deliberately parameterless. This
-    prevents a future or modified client from smuggling executable text, paths or
-    other arbitrary data through the remote-command queue.
+    Every action except ``show_notification`` and ``open_app`` is deliberately
+    parameterless. ``open_app`` accepts only a friendly installed-app name; paths,
+    URLs, switches and shell punctuation are rejected.
     """
 
     if action not in ALLOWED_ACTIONS:
         raise ValueError("Unsupported remote command action.")
+    if action == "open_app":
+        if set(payload) != {"app_name"}:
+            raise ValueError("Open app accepts exactly one app_name value.")
+        app_name = payload.get("app_name")
+        if not isinstance(app_name, str):
+            raise ValueError("App name must be text.")
+        app_name = " ".join(app_name.split())[:APP_NAME_MAX_LENGTH]
+        folded = app_name.casefold()
+        if (
+            not app_name
+            or not SAFE_APP_NAME.fullmatch(app_name)
+            or folded.endswith(BLOCKED_APP_SUFFIXES)
+            or folded in BLOCKED_COMMAND_HOSTS
+            or any(part.startswith("-") for part in app_name.split())
+        ):
+            raise ValueError("Use only the installed app's normal display name, without a path, URL or command.")
+        return {"app_name": app_name}
+
     if action != "show_notification":
         if payload:
             raise ValueError("This remote command does not accept details.")

@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V15 Cloud"
-APP_VERSION = "15.9.5"
+APP_VERSION = "15.9.6"
 LJ_AI_WEBSITE = "https://lj-ai-official-site.pages.dev/"
 
 # V15.9.1-V15.9.4 Windows clients may require /health to report their exact
@@ -77,8 +77,8 @@ SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-OPENAI_USER_MODEL = os.getenv("OPENAI_USER_MODEL", "gpt-5-mini").strip()
-OPENAI_ADMIN_MODEL = os.getenv("OPENAI_ADMIN_MODEL", "gpt-5.6").strip()
+OPENAI_USER_MODEL = os.getenv("OPENAI_USER_MODEL", "gpt-5.6-terra").strip()
+OPENAI_ADMIN_MODEL = os.getenv("OPENAI_ADMIN_MODEL", "gpt-6-astra").strip()
 OPENAI_VOICE_REPLY_MODEL = os.getenv("OPENAI_VOICE_REPLY_MODEL", "gpt-5.6-luna").strip()
 OPENAI_VOICE_DEEP_MODEL = os.getenv("OPENAI_VOICE_DEEP_MODEL", "gpt-5.6-terra").strip()
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe").strip()
@@ -88,6 +88,10 @@ OPENAI_WEB_MODEL = os.getenv("OPENAI_WEB_MODEL", OPENAI_USER_MODEL).strip()
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-5.6").strip()
 OPENAI_IMAGE_TOOL_MODEL = os.getenv("OPENAI_IMAGE_TOOL_MODEL", "gpt-image-2").strip()
 OPENAI_TEXT_FAST_MODEL = os.getenv("OPENAI_TEXT_FAST_MODEL", OPENAI_VOICE_REPLY_MODEL).strip()
+OPENAI_TEXT_BALANCED_MODEL = os.getenv("OPENAI_TEXT_BALANCED_MODEL", "gpt-5.6-terra").strip()
+OPENAI_TEXT_SMART_MODEL = os.getenv("OPENAI_TEXT_SMART_MODEL", "gpt-5.6").strip()
+OPENAI_TEXT_DEEP_MODEL = os.getenv("OPENAI_TEXT_DEEP_MODEL", "gpt-6-astra").strip()
+OPENAI_TEXT_DEVELOPER_MODEL = os.getenv("OPENAI_TEXT_DEVELOPER_MODEL", OPENAI_ADMIN_MODEL).strip()
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip()
 OPENAI_VOICE_SERVICE_TIER = os.getenv("OPENAI_VOICE_SERVICE_TIER", "fast").strip().casefold()
 if OPENAI_VOICE_SERVICE_TIER not in {"default", "fast"}:
@@ -143,6 +147,20 @@ PLAN_PERIODS = {
     "BASIC": {"1_MONTH": 15.0, "3_MONTHS": 45.0, "12_MONTHS": 171.0},
     "PREMIUM": {"1_MONTH": 24.99, "3_MONTHS": 74.97, "12_MONTHS": 284.89},
     "VIP": {"1_MONTH": 59.99, "3_MONTHS": 179.97, "12_MONTHS": 683.89},
+}
+
+AI_MODE_PLANS: dict[str, set[str]] = {
+    "NORMAL": {"FREE", "BASIC", "PREMIUM", "VIP", "ADMIN"},
+    "SMART": {"PREMIUM", "VIP", "ADMIN"},
+    "DEEP_THINK": {"VIP", "ADMIN"},
+    "DEVELOPER": {"VIP", "ADMIN"},
+}
+
+AI_MODE_LABELS = {
+    "NORMAL": "Normal",
+    "SMART": "Smart",
+    "DEEP_THINK": "Deep Think",
+    "DEVELOPER": "Developer / Coding",
 }
 
 _SHARED_HTTP_CLIENT: httpx.AsyncClient | None = None
@@ -417,6 +435,8 @@ async def _usage_snapshot(user_id: str) -> dict[str, Any]:
     text_used = int(row.get("text_used") or 0)
     image_used = int(row.get("image_used") or 0)
     voice_used = int(row.get("voice_seconds_used") or 0)
+    max_reasoning_limit = None if row.get("max_reasoning_limit") is None else int(row.get("max_reasoning_limit"))
+    max_reasoning_used = int(row.get("max_reasoning_used") or 0)
     return {
         "text_used": text_used,
         "text_limit": text_limit,
@@ -427,6 +447,9 @@ async def _usage_snapshot(user_id: str) -> dict[str, Any]:
         "voice_seconds_used": voice_used,
         "voice_seconds_limit": voice_limit,
         "voice_seconds_remaining": None if voice_limit is None else max(0, voice_limit - voice_used),
+        "max_reasoning_used": max_reasoning_used,
+        "max_reasoning_limit": max_reasoning_limit,
+        "max_reasoning_remaining": None if max_reasoning_limit is None else max(0, max_reasoning_limit - max_reasoning_used),
         "refills_total": int(row.get("refills_total") or 0),
         "refills_used": int(row.get("refills_used") or 0),
         "refills_remaining": max(0, int(row.get("refills_total") or 0) - int(row.get("refills_used") or 0)),
@@ -441,6 +464,54 @@ async def _consume_usage(identity: Any, kind: str, amount: int = 1) -> dict[str,
     if not row.get("allowed"):
         raise HTTPException(status_code=429, detail={"message": f"Your {kind} allowance is used up for this billing cycle.", **row})
     return row
+
+
+def _authorise_ai_mode(identity: Any, requested_mode: str) -> str:
+    mode = requested_mode if requested_mode in AI_MODE_PLANS else "NORMAL"
+    plan = str(identity.effective_plan or "FREE").upper()
+    if plan not in AI_MODE_PLANS[mode]:
+        requirement = "Premium" if mode == "SMART" else "VIP"
+        raise HTTPException(
+            status_code=403,
+            detail=f"{AI_MODE_LABELS[mode]} mode requires {requirement} or Administrator access.",
+        )
+    return mode
+
+
+async def _consume_chat_usage(identity: Any, mode: str) -> dict[str, Any]:
+    if identity.role == "ADMIN":
+        return {
+            "allowed": True,
+            "plan_key": "ADMIN",
+            "text_remaining": None,
+            "max_reasoning_remaining": None,
+        }
+    try:
+        result = await _rpc(
+            "consume_lj_chat_usage",
+            {"p_user_id": identity.user_id, "p_mode": mode},
+        )
+    except HTTPException as error:
+        if error.status_code == 502:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "AI Smartness is waiting for the V15.9.6 Smart Mode database update. "
+                    "The LJ AI owner must run LJ_AI_V15_9_6_SMART_MODE_UPDATE.sql in Supabase."
+                ),
+            ) from error
+        raise
+    row = result[0] if isinstance(result, list) and result else result or {}
+    if row.get("allowed"):
+        return row
+    reason = str(row.get("denial_reason") or "")
+    if reason == "MAX_REASONING_LIMIT":
+        message = "Your VIP maximum-reasoning requests are used up for this billing cycle. Deep Think and Smart modes are still available."
+    elif reason == "MODE_NOT_INCLUDED":
+        message = "Developer / Coding mode requires VIP or Administrator access."
+    else:
+        message = "Your text allowance is used up for this billing cycle."
+    raise HTTPException(status_code=429, detail={"message": message, **row})
 
 
 class SlidingWindowLimiter:
@@ -1150,6 +1221,18 @@ class PasswordResetRequest(BaseModel):
     identifier: str = Field(min_length=3, max_length=254)
 
 
+class ResendConfirmationRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=254)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if not EMAIL_PATTERN.match(cleaned):
+            raise ValueError("Enter a valid email address.")
+        return cleaned
+
+
 class RecoveryCreateRequest(BaseModel):
     identifier: str = Field(min_length=3, max_length=254)
     message: str = Field(default="I need help recovering my LJ AI account.", min_length=1, max_length=1500)
@@ -1190,6 +1273,7 @@ class ChatRequest(BaseModel):
     memory: list[str] = Field(default_factory=list, max_length=50)
     from_voice: bool = False
     reply_mode: Literal["FAST", "NORMAL", "THOUGHTFUL"] = "FAST"
+    ai_mode: Literal["NORMAL", "SMART", "DEEP_THINK", "DEVELOPER"] = "NORMAL"
     web_enabled: bool = True
     client_platform: Literal["WINDOWS", "ANDROID"] = "WINDOWS"
     app_context: str = Field(default="", max_length=3000)
@@ -1752,6 +1836,17 @@ async def signup(body: SignUpRequest, request: Request) -> dict[str, Any]:
         # duplicate/existing-account outcome.
         if error.status_code in {400, 409, 422}:
             return public_response
+        detail = str(error.detail or "").casefold()
+        if error.status_code in {502, 503} and any(
+            marker in detail for marker in ("send", "smtp", "email", "mail")
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Confirmation email delivery is not configured for public signups yet. "
+                    "The LJ AI owner must connect a custom SMTP provider in Supabase, then try again."
+                ),
+            ) from error
         raise
 
     user = created.get("user") if isinstance(created.get("user"), dict) else created
@@ -1818,6 +1913,39 @@ async def signup(body: SignUpRequest, request: Request) -> dict[str, Any]:
             pass
         raise HTTPException(status_code=503, detail="Account confirmation could not be secured. Try again later.")
     return public_response
+
+
+@app.post("/v1/auth/resend-confirmation")
+async def resend_confirmation(body: ResendConfirmationRequest, request: Request) -> dict[str, str]:
+    """Resend without revealing whether an account exists."""
+    client_ip = request.client.host if request.client else "unknown"
+    await limiter.enforce(f"resend-confirmation:{client_ip}", 3, 3600)
+    redirect_url = _required_auth_redirect(
+        EMAIL_VERIFICATION_REDIRECT_URL, EMAIL_VERIFICATION_COMPLETION_PATH
+    )
+    try:
+        await _auth_request(
+            "POST",
+            "resend",
+            payload={
+                "type": "signup",
+                "email": body.email,
+                "options": {"emailRedirectTo": redirect_url},
+            },
+        )
+    except HTTPException as error:
+        if error.status_code == 429:
+            raise HTTPException(status_code=429, detail="Please wait before requesting another confirmation email.") from None
+        detail = str(error.detail or "").casefold()
+        if error.status_code in {502, 503} and any(
+            marker in detail for marker in ("send", "smtp", "email", "mail")
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Confirmation email delivery is unavailable. The LJ AI owner must check the Supabase custom SMTP settings.",
+            ) from error
+        # A single generic success response prevents account enumeration.
+    return {"message": "If that address is waiting for confirmation, a fresh email has been requested."}
 
 
 @app.post("/v1/auth/login")
@@ -2311,6 +2439,11 @@ async def me(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
         "screen_monitoring_enabled": True,
         "voice_enabled": identity.effective_plan in VOICE_PLANS,
         "cedar_enabled": identity.effective_plan in CEDAR_PLANS,
+        "ai_modes": [
+            mode for mode, plans in AI_MODE_PLANS.items()
+            if identity.effective_plan in plans
+        ],
+        "max_reasoning_remaining": usage.get("max_reasoning_remaining"),
         "device_id": identity.device_id,
         "active_devices": len(device_rows),
         "max_devices": MAX_DEVICES_PER_ACCOUNT,
@@ -2789,17 +2922,22 @@ async def chat(
     identity: Identity = Depends(current_identity),
 ) -> dict[str, Any]:
     await limiter.enforce(f"chat:{identity.user_id}", 30, 60)
-    # Administrator chat is unlimited. Paid/free accounts use the same V15.9
-    # billing-cycle ledger on Windows and Android.
+    # The visible Smartness selector belongs to text chat. Realtime and the
+    # compatibility voice path keep their separately tuned low-latency models
+    # and must not consume VIP maximum-reasoning requests.
+    ai_mode = _authorise_ai_mode(identity, "NORMAL" if body.from_voice else body.ai_mode)
+    await _consume_chat_usage(identity, ai_mode)
+    # Refresh the same server-owned ledger used by Windows and Android so the
+    # UI can display both ordinary text and VIP maximum-reasoning allowances.
     if identity.role == "ADMIN":
         allowance_row: dict[str, Any] = {
             "allowed": True,
             "messages_used": 0,
             "daily_limit": None,
             "text_remaining": None,
+            "max_reasoning_remaining": None,
         }
     else:
-        await _consume_usage(identity, "TEXT", 1)
         snapshot = await _usage_snapshot(identity.user_id)
         allowance_row = {
             "allowed": True,
@@ -2813,9 +2951,6 @@ async def chat(
         body.message,
         flags=re.IGNORECASE,
     ))
-    model = OPENAI_ADMIN_MODEL if (
-        identity.role == "ADMIN" or (identity.effective_plan == "VIP" and coding_request)
-    ) else OPENAI_USER_MODEL
     # LJ AI's own catalogue is server-controlled. Do not replace it with stale
     # search snippets merely because a user says "price" or "website".
     web_request = (
@@ -2834,14 +2969,39 @@ async def chat(
             "THOUGHTFUL": {"CONCISE": 320, "BALANCED": 650, "DETAILED": 1100},
         }[body.reply_mode][body.detail]
         history_turns = MAX_HISTORY_TURNS if body.reply_mode != "FAST" else 6
+        reasoning_effort = "medium" if deep_voice_request else ("none" if body.reply_mode == "FAST" else "low")
+        response_verbosity = "medium" if deep_voice_request else "low"
     else:
-        if body.reply_mode == "FAST" and not web_request:
+        if ai_mode == "NORMAL" and identity.effective_plan == "FREE":
             model = OPENAI_TEXT_FAST_MODEL
             max_output_tokens = {"CONCISE": 220, "BALANCED": 420, "DETAILED": 700}[body.detail]
             history_turns = 10
-        else:
-            max_output_tokens = {"CONCISE": 500, "BALANCED": 1000, "DETAILED": 1600}[body.detail]
+            reasoning_effort = "none"
+            response_verbosity = "low"
+        elif ai_mode == "NORMAL":
+            model = OPENAI_TEXT_BALANCED_MODEL
+            max_output_tokens = {"CONCISE": 500, "BALANCED": 1000, "DETAILED": 1800}[body.detail]
             history_turns = MAX_HISTORY_TURNS
+            reasoning_effort = "low"
+            response_verbosity = "medium"
+        elif ai_mode == "SMART":
+            model = OPENAI_TEXT_SMART_MODEL
+            max_output_tokens = {"CONCISE": 900, "BALANCED": 2200, "DETAILED": 4000}[body.detail]
+            history_turns = MAX_HISTORY_TURNS
+            reasoning_effort = "high"
+            response_verbosity = "medium"
+        elif ai_mode == "DEEP_THINK":
+            model = OPENAI_TEXT_DEEP_MODEL
+            max_output_tokens = {"CONCISE": 1400, "BALANCED": 4000, "DETAILED": 7000}[body.detail]
+            history_turns = MAX_HISTORY_TURNS
+            reasoning_effort = "xhigh"
+            response_verbosity = "high"
+        else:
+            model = OPENAI_TEXT_DEVELOPER_MODEL
+            max_output_tokens = {"CONCISE": 2200, "BALANCED": 6000, "DETAILED": 12000}[body.detail]
+            history_turns = MAX_HISTORY_TURNS
+            reasoning_effort = "max"
+            response_verbosity = "high"
     conversation = [turn.model_dump() for turn in body.history[-history_turns:]]
     conversation.append({"role": "user", "content": body.message})
     payload: dict[str, Any] = {
@@ -2863,39 +3023,32 @@ async def chat(
             "\nThis is a latency-sensitive spoken turn. Start with the answer, skip filler, "
             "and normally use one to three short sentences unless the user asks for detail."
         )
-        payload["text"] = {"verbosity": "medium" if deep_voice_request else "low"}
-        payload["reasoning"] = {
-            "effort": "medium" if deep_voice_request else ("none" if body.reply_mode == "FAST" else "low")
-        }
+        payload["text"] = {"verbosity": response_verbosity}
+        payload["reasoning"] = {"effort": reasoning_effort}
         if OPENAI_VOICE_SERVICE_TIER == "fast":
             payload["service_tier"] = "fast"
-    elif body.reply_mode == "FAST" and not web_request:
-        payload["text"] = {"verbosity": "low"}
-        payload["reasoning"] = {"effort": "none"}
+    else:
+        payload["text"] = {"verbosity": response_verbosity}
+        payload["reasoning"] = {"effort": reasoning_effort}
+    if not body.from_voice and ai_mode == "NORMAL" and identity.effective_plan == "FREE":
         if OPENAI_TEXT_SERVICE_TIER == "fast":
             payload["service_tier"] = "fast"
-    elif OPENAI_REASONING_EFFORT:
-        payload["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
 
     if coding_request and identity.effective_plan in {"VIP", "ADMIN"} and not body.from_voice:
-        # The fast text branch above deliberately optimises ordinary turns, but
-        # must not overwrite the deeper coding model promised to VIP/Admin.
-        model = OPENAI_ADMIN_MODEL
-        payload["model"] = model
-        payload["reasoning"] = {"effort": "medium"}
         payload["max_output_tokens"] = max(int(payload["max_output_tokens"]), 1800)
         payload["instructions"] += (
-            "\nThis is a coding request from a VIP or Administrator account. Diagnose before changing code, "
+            f"\nThis is a coding request using {AI_MODE_LABELS[ai_mode]} mode for a VIP or Administrator account. Diagnose before changing code, "
             "preserve working behaviour, call out security-sensitive assumptions, and include a practical verification step."
         )
 
     if web_request:
-        model = OPENAI_WEB_MODEL
-        payload["model"] = model
+        if ai_mode == "NORMAL":
+            model = OPENAI_WEB_MODEL
+            payload["model"] = model
         payload["tools"] = [{"type": "web_search"}]
-        payload["reasoning"] = {"effort": "none"}
-        payload["text"] = {"verbosity": "low" if body.reply_mode == "FAST" else "medium"}
-        if OPENAI_TEXT_SERVICE_TIER == "fast":
+        payload["reasoning"] = {"effort": reasoning_effort}
+        payload["text"] = {"verbosity": response_verbosity}
+        if ai_mode == "NORMAL" and OPENAI_TEXT_SERVICE_TIER == "fast":
             payload["service_tier"] = "fast"
         payload["instructions"] += (
             "\nThe user explicitly requested current public web information or supplied a public link. "
@@ -2926,6 +3079,8 @@ async def chat(
     return {
         "reply": reply,
         "model": model,
+        "ai_mode": ai_mode,
+        "ai_mode_label": AI_MODE_LABELS[ai_mode],
         "messages_used": allowance_row.get("messages_used", allowance_row.get("text_used")),
         "daily_limit": allowance_row.get("daily_limit"),
         "allowance": allowance_row,
@@ -3167,6 +3322,26 @@ async def realtime_token(
             ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
+        {
+            "type": "function",
+            "name": "control_linked_device",
+            "description": (
+                "Send one allow-listed action to the user's other actively paired LJ AI device only after a direct request that names the other device. "
+                "OPEN_APP accepts only an ordinary installed-app display name, never a path, URL, command or script. Both LJ AI apps must be open."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["OPEN_APP", "OPEN_LJ_AI", "MEDIA_PLAY_PAUSE", "VOLUME_MUTE"],
+                    },
+                    "target": {"type": "string", "maxLength": 80},
+                },
+                "required": ["action", "target"],
+                "additionalProperties": False,
+            },
+        },
         ])
         if body.client_platform == "ANDROID":
             tools.append({
@@ -3185,6 +3360,20 @@ async def realtime_token(
                         "name": {"type": "string", "maxLength": 80},
                     },
                     "required": ["action", "name"],
+                    "additionalProperties": False,
+                },
+            })
+            tools.append({
+                "type": "function",
+                "name": "run_skill",
+                "description": (
+                    "Run one saved Teach LJ Skill only when the user directly says its saved name or explicitly asks to run it. "
+                    "The client re-checks the microphone transcript, resolves an exact saved Skill, and keeps every required confirmation visible."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"skill_name": {"type": "string", "maxLength": 80}},
+                    "required": ["skill_name"],
                     "additionalProperties": False,
                 },
             })
@@ -3352,10 +3541,11 @@ async def realtime_token(
     platform_label = "Windows desktop" if body.client_platform == "WINDOWS" else "Android mobile"
     bridge_action_rules = (
         "For close requests, use close_active_browser_tab for one browser tab and close_windows_item for a normal app or window. "
+        "Use control_linked_device only when the user explicitly requests an action on the paired Android phone. "
         "Never say a Windows item fully closed when the tool only reports that Windows accepted the request."
         if body.client_platform == "WINDOWS"
         else (
-            "Use control_android_device for supported phone actions and teach_lj only for START, STOP, SAVE or SHOW. "
+            "Use control_android_device for actions on this phone, control_linked_device only for actions explicitly requested on the paired Windows PC, and teach_lj only for START, STOP, SAVE or SHOW. "
             "Android permission screens and every final Call or Send press remain under the user's visible control."
         )
     )

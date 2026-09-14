@@ -19,9 +19,9 @@ services:
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_USER_MODEL
-        value: gpt-5-mini
+        value: gpt-5.6-terra
       - key: OPENAI_ADMIN_MODEL
-        value: gpt-5.6
+        value: gpt-6-astra
       - key: OPENAI_VOICE_REPLY_MODEL
         value: gpt-5.6-luna
       - key: OPENAI_VOICE_DEEP_MODEL
@@ -40,6 +40,14 @@ services:
         value: gpt-image-2
       - key: OPENAI_TEXT_FAST_MODEL
         value: gpt-5.6-luna
+      - key: OPENAI_TEXT_BALANCED_MODEL
+        value: gpt-5.6-terra
+      - key: OPENAI_TEXT_SMART_MODEL
+        value: gpt-5.6
+      - key: OPENAI_TEXT_DEEP_MODEL
+        value: gpt-6-astra
+      - key: OPENAI_TEXT_DEVELOPER_MODEL
+        value: gpt-6-astra
       - key: OPENAI_TEXT_SERVICE_TIER
         value: fast
       - key: OPENAI_REASONING_EFFORT

@@ -46,7 +46,7 @@ create table if not exists public.device_remote_commands (
     target_device_id text not null,
     action text not null check (action in (
         'show_notification', 'media_play_pause', 'media_next', 'volume_mute',
-        'lock_pc', 'open_lj_ai', 'run_diagnostic'
+        'lock_pc', 'open_lj_ai', 'run_diagnostic', 'open_app'
     )),
     payload jsonb not null default '{}'::jsonb,
     requires_pc_confirmation boolean not null default false,

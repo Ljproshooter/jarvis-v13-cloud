@@ -586,6 +586,24 @@ class OwnerRecoverySecurityTests(unittest.IsolatedAsyncioTestCase):
             source,
         )
 
+    def test_ai_smartness_modes_are_server_owned_by_plan(self) -> None:
+        self.assertEqual(main._authorise_ai_mode(SimpleNamespace(effective_plan="FREE"), "NORMAL"), "NORMAL")
+        self.assertEqual(main._authorise_ai_mode(SimpleNamespace(effective_plan="PREMIUM"), "SMART"), "SMART")
+        self.assertEqual(main._authorise_ai_mode(SimpleNamespace(effective_plan="VIP"), "DEEP_THINK"), "DEEP_THINK")
+        self.assertEqual(main._authorise_ai_mode(SimpleNamespace(effective_plan="ADMIN"), "DEVELOPER"), "DEVELOPER")
+        with self.assertRaises(HTTPException) as free_smart:
+            main._authorise_ai_mode(SimpleNamespace(effective_plan="FREE"), "SMART")
+        self.assertEqual(free_smart.exception.status_code, 403)
+        with self.assertRaises(HTTPException) as premium_deep:
+            main._authorise_ai_mode(SimpleNamespace(effective_plan="PREMIUM"), "DEEP_THINK")
+        self.assertEqual(premium_deep.exception.status_code, 403)
+
+    def test_unknown_ai_mode_falls_back_to_normal(self) -> None:
+        self.assertEqual(
+            main._authorise_ai_mode(SimpleNamespace(effective_plan="FREE"), "NOT_A_MODE"),
+            "NORMAL",
+        )
+
 
 class MobileUpdateMetadataTests(unittest.IsolatedAsyncioTestCase):
     async def test_complete_newer_android_release_is_advertised(self) -> None:
@@ -610,16 +628,16 @@ class MobileUpdateMetadataTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_android_update_is_not_offered_to_same_or_newer_install(self) -> None:
         with (
-            patch.object(main, "ANDROID_LATEST_VERSION_NAME", "15.9.5"),
-            patch.object(main, "ANDROID_LATEST_VERSION_CODE", "15906"),
+            patch.object(main, "ANDROID_LATEST_VERSION_NAME", "15.9.6"),
+            patch.object(main, "ANDROID_LATEST_VERSION_CODE", "15907"),
             patch.object(
                 main,
                 "ANDROID_UPDATE_URL",
-                "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.5/LJ_AI_Mobile_V15.9.5.apk",
+                "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.6/LJ_AI_Mobile_V15.9.6.apk",
             ),
             patch.object(main, "ANDROID_UPDATE_SHA256", "b" * 64),
         ):
-            response = await main.mobile_update(installed_code=15906)
+            response = await main.mobile_update(installed_code=15907)
 
         payload = json.loads(response.body)
         self.assertTrue(payload["configured"])
@@ -632,7 +650,7 @@ class MobileUpdateMetadataTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "ANDROID_UPDATE_URL", "https://example.com/update.apk"),
             patch.object(main, "ANDROID_UPDATE_SHA256", "not-a-checksum"),
         ):
-            response = await main.mobile_update(installed_code=15906)
+            response = await main.mobile_update(installed_code=15907)
 
         payload = json.loads(response.body)
         self.assertFalse(payload["configured"])
@@ -643,12 +661,12 @@ class MobileUpdateMetadataTests(unittest.IsolatedAsyncioTestCase):
     def test_android_release_url_rejects_lookalikes(self) -> None:
         self.assertTrue(
             main._trusted_android_release_url(
-                "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.5/LJ_AI_Mobile_V15.9.5.apk"
+                "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.6/LJ_AI_Mobile_V15.9.6.apk"
             )
         )
-        self.assertFalse(main._trusted_android_release_url("http://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.5/app.apk"))
-        self.assertFalse(main._trusted_android_release_url("https://github.com.evil.example/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.5/app.apk"))
-        self.assertFalse(main._trusted_android_release_url("https://github.com/other/repo/releases/download/v15.9.5/app.apk"))
+        self.assertFalse(main._trusted_android_release_url("http://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.6/app.apk"))
+        self.assertFalse(main._trusted_android_release_url("https://github.com.evil.example/Ljproshooter/jarvis-v13-cloud/releases/download/v15.9.6/app.apk"))
+        self.assertFalse(main._trusted_android_release_url("https://github.com/other/repo/releases/download/v15.9.6/app.apk"))
 
 
 if __name__ == "__main__":

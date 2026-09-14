@@ -32,6 +32,7 @@ SAFE_PREFERENCE_KEYS = {
     "file_access",
     "weather_location",
     "personality",
+    "ai_mode",
 }
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,100}$")
 VOICE_LEASE_SECONDS = 90

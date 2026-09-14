@@ -1,4 +1,4 @@
--- LJ AI V15.9.5 additive verified-email and recovery security migration.
+-- LJ AI V15.9.6 additive verified-email and recovery security migration.
 -- Run once in Supabase SQL Editor before deploying the matching cloud code.
 begin;
 
