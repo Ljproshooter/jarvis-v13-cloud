@@ -32,15 +32,17 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-APP_NAME = "LJ AI V15 Cloud"
-APP_VERSION = "15.9.9"
+APP_NAME = "LJ AI V16 Cloud"
+APP_VERSION = "16.0.0"
 LJ_AI_WEBSITE = "https://lj-ai-official-site.pages.dev/"
 
-# V15.9.1-V15.9.4 Windows clients may require /health to report their exact
+# V15.9.x Windows clients may require /health to report their exact
 # installed version before allowing sign-in. Keep that compatibility handshake
 # working long enough for those clients to sign in and use the verified updater.
 # Current clients and every non-Windows caller still receive APP_VERSION.
-LEGACY_WINDOWS_HEALTH_VERSIONS = {"15.9.1", "15.9.2", "15.9.3", "15.9.4"}
+LEGACY_WINDOWS_HEALTH_VERSIONS = {
+    "15.9.1", "15.9.2", "15.9.3", "15.9.4", "15.9.5", "15.9.6", "15.9.7", "15.9.8", "15.9.9",
+}
 
 # Owner-assisted password changes are intentionally disabled until LJ AI has a
 # verified proof channel (for example, a signed-in existing device or verified
@@ -4248,6 +4250,33 @@ async def web_lookup(
     return {"reply": reply, "model": OPENAI_WEB_MODEL, "allowance": allowance}
 
 
+def _realtime_supports_v16_controls(body: RealtimeTokenRequest) -> bool:
+    """Negotiate tool compatibility from the version existing clients already send.
+
+    This is only a compatibility hint; identity and action permissions are still
+    enforced independently. Unknown clients retain the pre-V16 tool contract.
+    """
+    snapshot = body.app_context.strip()
+    version = ""
+    if body.client_platform == "ANDROID":
+        match = re.match(r"^LJ AI Mobile Android (\d+\.\d+\.\d+)(?:;|$)", snapshot)
+        version = match.group(1) if match else ""
+    else:
+        try:
+            app_data = json.loads(snapshot).get("app", {})
+        except (ValueError, AttributeError):
+            # Windows caps the snapshot at 6000 characters, possibly truncating
+            # later conversation context. Its leading app object is complete.
+            prefix = re.match(r'^\{\s*"bridge"\s*:\s*\{[^{}]*\}\s*,\s*"app"\s*:\s*', snapshot)
+            try:
+                app_data = json.JSONDecoder().raw_decode(snapshot[prefix.end():])[0] if prefix else {}
+            except ValueError:
+                app_data = {}
+        if isinstance(app_data, dict) and app_data.get("platform") == "WINDOWS":
+            version = str(app_data.get("version", ""))
+    return bool(re.fullmatch(r"\d{1,4}\.\d{1,4}\.\d{1,4}", version)) and tuple(map(int, version.split("."))) >= (16, 0, 0)
+
+
 @app.post("/v1/realtime/token")
 async def realtime_token(
     body: RealtimeTokenRequest,
@@ -4627,7 +4656,9 @@ async def realtime_token(
                     "type": "function",
                     "name": "control_android_device",
                     "description": (
-                        "Perform one allow-listed Android action after a direct user request. OPEN_APP uses target as the visible app name. "
+                        "Perform one supported Android action after a direct user request. OPEN_APP uses target as the visible installed app name. "
+                        "OPEN_APP_SCREEN uses target as the app name and screen as one explicitly requested navigation label, such as Routines in SmartThings. "
+                        "This only selects a unique visible native navigation control; it cannot guarantee every app or screen is accessible. "
                         "DIAL_NUMBER opens Android's dialler with target but never presses Call. COMPOSE_SMS prepares target/message but never presses Send. "
                         "SET_BRIGHTNESS uses target as a value from 1 to 100; use REQUEST_BRIGHTNESS_PERMISSION only when the local result says permission is needed. "
                         "SHOW_NOTIFICATIONS only expands the shade and does not read or transmit its contents. ENABLE_NOTIFICATION_SHADE_ACCESS opens Android Accessibility settings. "
@@ -4639,7 +4670,7 @@ async def realtime_token(
                             "action": {
                                 "type": "string",
                                 "enum": [
-                                    "OPEN_APP", "OPEN_CAMERA", "OPEN_SETTINGS", "OPEN_WIFI", "OPEN_BLUETOOTH",
+                                    "OPEN_APP", "OPEN_APP_SCREEN", "OPEN_CAMERA", "OPEN_SETTINGS", "OPEN_WIFI", "OPEN_BLUETOOTH",
                                     "TORCH_ON", "TORCH_OFF", "VOLUME_UP", "VOLUME_DOWN", "MUTE", "UNMUTE",
                                     "MEDIA_PLAY_PAUSE", "DIAL_NUMBER", "COMPOSE_SMS", "SHARE_MESSAGE", "OPEN_CALL_APP",
                                     "SHOW_NOTIFICATIONS", "ENABLE_NOTIFICATION_SHADE_ACCESS", "OPEN_NOTIFICATION_SETTINGS",
@@ -4648,27 +4679,65 @@ async def realtime_token(
                                 ],
                             },
                             "target": {"type": "string", "maxLength": 300},
+                            "screen": {"type": "string", "maxLength": 120},
                             "message": {"type": "string", "maxLength": 1200},
                             "platform": {"type": "string", "maxLength": 80},
                         },
-                        "required": ["action", "target", "message", "platform"],
+                        "required": ["action", "target", "screen", "message", "platform"],
                         "additionalProperties": False,
                     },
                 },
-                {
-                    "type": "function", "name": "control_smartthings",
-                    "description": "Immediately operate an already connected SmartThings TV or device after a direct voice request. Use LAUNCH_APP for TV apps such as Netflix or YouTube. Use value for an app, channel, input, or volume; otherwise use an empty string. RUN_SCENE still requires visible confirmation.",
-                    "parameters": {"type": "object", "properties": {
-                        "action": {"type": "string", "enum": [
-                            "SWITCH_ON", "SWITCH_OFF", "VOLUME_UP", "VOLUME_DOWN", "SET_VOLUME",
-                            "MUTE", "UNMUTE", "PLAY", "PAUSE", "STOP", "CHANNEL_UP", "CHANNEL_DOWN",
-                            "SET_CHANNEL", "SET_INPUT", "LAUNCH_APP", "RUN_SCENE",
-                        ]},
-                        "target": {"type": "string", "maxLength": 300},
-                        "value": {"type": "string", "maxLength": 300},
-                    }, "required": ["action", "target", "value"], "additionalProperties": False},
-                },
             ])
+        tools.append({
+            "type": "function", "name": "get_smartthings_devices",
+            "description": "List the user's connected SmartThings devices and their advertised capabilities before identifying a TV or checking whether a remote action is available. Read-only.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        })
+        tools.append({
+            "type": "function", "name": "control_smartthings",
+            "description": (
+                "Control an already connected SmartThings TV/device after a direct request on either Windows or Android. "
+                "Use LAUNCH_APP for TV apps such as Netflix or YouTube. VOLUME_UP/DOWN value is the explicitly requested "
+                "number of steps (1-20), for example '10' for 'turn TV volume up 10x'; empty means one step. "
+                "SET_VOLUME is an absolute level from 0 to 100. REWIND/FAST_FORWARD value is the exact spoken duration "
+                "including units, such as '5 seconds' or '15 minutes'; empty requests continuous transport only. "
+                "When the user just says TV or it, keep target as TV; do not invent a room or device name. "
+                "Use target for the named TV/device and value for app, channel, input, count, or duration. "
+                "Capabilities vary by TV and streaming app. Never substitute guessed button repetitions for exact seeking. "
+                "Use the result message: accepted/unconfirmed means sent, not completed. RUN_SCENE requires visible confirmation."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": [
+                    "SWITCH_ON", "SWITCH_OFF", "VOLUME_UP", "VOLUME_DOWN", "SET_VOLUME",
+                    "MUTE", "UNMUTE", "PLAY", "PAUSE", "STOP", "REWIND", "FAST_FORWARD",
+                    "CHANNEL_UP", "CHANNEL_DOWN", "SET_CHANNEL", "SET_INPUT", "LAUNCH_APP", "RUN_SCENE",
+                ]},
+                "target": {"type": "string", "maxLength": 300},
+                "value": {"type": "string", "maxLength": 300},
+            }, "required": ["action", "target", "value"], "additionalProperties": False},
+        })
+    if not _realtime_supports_v16_controls(body):
+        tools = [tool for tool in tools if tool["name"] != "get_smartthings_devices"
+                 and not (body.client_platform == "WINDOWS" and tool["name"] == "control_smartthings")]
+        for tool in tools:
+            if tool["name"] == "control_android_device":
+                parameters = tool["parameters"]
+                parameters["properties"].pop("screen", None)
+                parameters["required"].remove("screen")
+                parameters["properties"]["action"]["enum"].remove("OPEN_APP_SCREEN")
+                tool["description"] = (
+                    "Perform one allow-listed Android action after a direct user request. OPEN_APP uses target as the visible app name. "
+                    + tool["description"][tool["description"].index("DIAL_NUMBER"):]
+                )
+            elif tool["name"] == "control_smartthings":
+                actions = tool["parameters"]["properties"]["action"]["enum"]
+                actions.remove("REWIND")
+                actions.remove("FAST_FORWARD")
+                tool["description"] = (
+                    "Immediately operate an already connected SmartThings TV or device after a direct voice request. "
+                    "Use LAUNCH_APP for TV apps such as Netflix or YouTube. Use value for an app, channel, input, or volume; "
+                    "otherwise use an empty string. RUN_SCENE still requires visible confirmation."
+                )
     app_snapshot = body.app_context.strip()
     platform_label = "Windows desktop" if body.client_platform == "WINDOWS" else "Android mobile"
     bridge_action_rules = (
