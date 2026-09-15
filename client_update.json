@@ -1,6 +1,6 @@
 {
-  "version": "15.9.8",
+  "version": "15.9.9",
   "download_url": "https://jarvis-v13-cloud.onrender.com/v1/client/download",
-  "sha256": "6c1bab6b6a6b8d3fd90f70aa5e6192056ee31a9e9a9681e818234678d2ea25d9",
-  "notes": "LJ AI V15.9.8 opens saved accounts immediately, reconnects in the background, ignores brief network misses, and keeps large chat histories responsive."
+  "sha256": "e186fd91439c4ba7c684d9ce884db2544afdb08a191a6c9654e231670ba63178",
+  "notes": "LJ AI V15.9.9 improves Realtime echo suppression and interruptions, honours Full Access for normal Windows actions, and expands SmartThings TV voice control."
 }
