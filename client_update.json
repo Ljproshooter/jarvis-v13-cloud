@@ -1,6 +1,6 @@
 {
-  "version": "15.9.5",
+  "version": "15.9.7",
   "download_url": "https://jarvis-v13-cloud.onrender.com/v1/client/download",
-  "sha256": "6088c386ecdd06caac021c678a37c9763ed77dcd2596af62ade290f18696de57",
-  "notes": "LJ AI V15.9.5 adds Teach LJ Skills, live Stripe billing, stronger account security, improved platform-aware chat and voice, safer Android device controls, and verified in-app updates for Windows and Android."
+  "sha256": "c618ce092ecb785b86e65cc84e95e4f76c799a24f760b75619197524c0e12c8d",
+  "notes": "LJ AI V15.9.7 adds cleaner multi-chat messaging, improved photo attachments, private cross-device memory, and more reliable Teach LJ Skills."
 }
