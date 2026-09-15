@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V15 Cloud"
-APP_VERSION = "15.9.7"
+APP_VERSION = "15.9.9"
 LJ_AI_WEBSITE = "https://lj-ai-official-site.pages.dev/"
 
 # V15.9.1-V15.9.4 Windows clients may require /health to report their exact
