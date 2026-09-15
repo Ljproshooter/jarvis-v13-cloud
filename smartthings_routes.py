@@ -196,7 +196,7 @@ def create_smartthings_router(
 
     @router.get("/smartthings/oauth/callback")
     async def oauth_callback(
-        code: str = Query(min_length=8, max_length=2048),
+        code: str = Query(min_length=1, max_length=2048),
         state: str = Query(min_length=20, max_length=512),
     ) -> RedirectResponse:
         client_id, client_secret, redirect_uri, cipher = config()
