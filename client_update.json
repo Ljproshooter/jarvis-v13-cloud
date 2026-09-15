@@ -1,6 +1,6 @@
 {
-  "version": "15.9.9",
-  "download_url": "https://jarvis-v13-cloud.onrender.com/v1/client/download",
-  "sha256": "e186fd91439c4ba7c684d9ce884db2544afdb08a191a6c9654e231670ba63178",
-  "notes": "LJ AI V15.9.9 improves Realtime echo suppression and interruptions, honours Full Access for normal Windows actions, and expands SmartThings TV voice control."
+  "version": "16.0.0",
+  "download_url": "https://github.com/Ljproshooter/jarvis-v13-cloud/releases/download/v16.0.0/LJ_AI_Setup.exe",
+  "sha256": "35be5a00ea1f46e54d360b45ad81d0379cf4f80c95bfa032679fcd19adc495a3",
+  "notes": "LJ AI V16.0.0 improves Realtime playback and interruptions, honours Full Access for ordinary direct Windows actions, and expands supported SmartThings TV voice controls."
 }
