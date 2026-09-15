@@ -1,6 +1,6 @@
 {
-  "version": "15.9.7",
+  "version": "15.9.8",
   "download_url": "https://jarvis-v13-cloud.onrender.com/v1/client/download",
-  "sha256": "c618ce092ecb785b86e65cc84e95e4f76c799a24f760b75619197524c0e12c8d",
-  "notes": "LJ AI V15.9.7 adds cleaner multi-chat messaging, improved photo attachments, private cross-device memory, and more reliable Teach LJ Skills."
+  "sha256": "6c1bab6b6a6b8d3fd90f70aa5e6192056ee31a9e9a9681e818234678d2ea25d9",
+  "notes": "LJ AI V15.9.8 opens saved accounts immediately, reconnects in the background, ignores brief network misses, and keeps large chat histories responsive."
 }
