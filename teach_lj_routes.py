@@ -245,6 +245,11 @@ def _uuid(value: str, unavailable: str) -> str:
         raise HTTPException(status_code=404, detail=unavailable) from None
 
 
+def normalize_skill_phrase(value: str) -> str:
+    """Normalize for exact voice matching; never approximate or fuzzy match."""
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).split())[:100]
+
+
 def _contains_word(value: str, words: set[str]) -> bool:
     normalized = " ".join(re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).split())
     padded = f" {normalized} "
@@ -812,6 +817,41 @@ class SkillDuplicate(BaseModel):
         return " ".join(value.split()) if value is not None else None
 
 
+class SkillAliasesUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    aliases: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("aliases")
+    @classmethod
+    def clean_aliases(cls, values: list[str]) -> list[str]:
+        aliases: list[str] = []
+        normalized_seen: set[str] = set()
+        for value in values:
+            phrase = " ".join(str(value).split())[:100]
+            normalized = normalize_skill_phrase(phrase)
+            if not normalized:
+                raise ValueError("Each Skill alias must contain letters or numbers.")
+            if _contains_word(phrase, SENSITIVE_WORDS):
+                raise ValueError("A Skill alias cannot contain secret or payment labels.")
+            if normalized not in normalized_seen:
+                aliases.append(phrase)
+                normalized_seen.add(normalized)
+        return aliases
+
+
+class SkillResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    phrase: str = Field(min_length=1, max_length=100)
+
+    @field_validator("phrase")
+    @classmethod
+    def clean_phrase(cls, value: str) -> str:
+        phrase = " ".join(value.split())
+        if not normalize_skill_phrase(phrase):
+            raise ValueError("Say the exact Skill name or alias.")
+        return phrase
+
+
 class SkillRunStart(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: Literal["TEST", "EXECUTE"] = "EXECUTE"
@@ -912,7 +952,7 @@ def confirmation_reason(step: dict[str, Any], safety_policy: dict[str, Any]) -> 
     if action == "press_key":
         key = str(arguments.get("key") or "").upper()
         modifiers = {str(item).upper() for item in arguments.get("modifiers", []) if isinstance(item, str)}
-        if key in {"DELETE", "ENTER", "SPACE"}:
+        if key in {"BACKSPACE", "DELETE", "ENTER", "SPACE"}:
             return "This keyboard action can change or submit the focused control and needs confirmation."
     if action in RISKY_ACTIONS:
         return f"{action} is important, external, or irreversible and always needs confirmation."
@@ -1240,10 +1280,25 @@ def create_teach_lj_router(
         ) or []
         if any(
             str(row.get("id")) != str(excluding or "")
-            and str(row.get("name") or "").casefold() == name.casefold()
+            and normalize_skill_phrase(str(row.get("name") or "")) == normalize_skill_phrase(name)
             for row in rows
         ):
             raise HTTPException(status_code=409, detail="You already have a Skill with that name.")
+        aliases = await rest_request(
+            "GET",
+            "lj_skill_triggers",
+            params={
+                "user_id": f"eq.{user_id}",
+                "select": "skill_id,normalized_phrase",
+                "limit": "500",
+            },
+        ) or []
+        if any(
+            str(row.get("skill_id")) != str(excluding or "")
+            and str(row.get("normalized_phrase") or "") == normalize_skill_phrase(name)
+            for row in aliases
+        ):
+            raise HTTPException(status_code=409, detail="That name is already an alias for another Skill.")
 
     def make_confirmation(
         step: dict[str, Any],
@@ -1318,12 +1373,165 @@ def create_teach_lj_router(
         version = await get_version(skill)
         return {**public_skill(skill), "workflow": version}
 
+    @router.post("/skills/resolve")
+    async def resolve_skill(
+        body: SkillResolveRequest,
+        identity: Any = Depends(current_identity),
+    ) -> dict[str, Any]:
+        user_id = str(_identity_value(identity, "user_id"))
+        await limiter.enforce(f"skills-resolve:{user_id}", 60, 60)
+        normalized = normalize_skill_phrase(body.phrase)
+        skills = await rest_request(
+            "GET",
+            "lj_skills",
+            params={
+                "user_id": f"eq.{user_id}",
+                "deleted_at": "is.null",
+                "enabled": "eq.true",
+                "select": "*",
+                "limit": "200",
+            },
+        ) or []
+        aliases = await rest_request(
+            "GET",
+            "lj_skill_triggers",
+            params={
+                "user_id": f"eq.{user_id}",
+                "select": "skill_id,phrase,normalized_phrase",
+                "limit": "500",
+            },
+        ) or []
+        matched: dict[str, tuple[dict[str, Any], str]] = {}
+        for skill in skills:
+            if normalize_skill_phrase(str(skill.get("name") or "")) == normalized:
+                matched[str(skill.get("id"))] = (skill, "NAME")
+        skill_by_id = {str(skill.get("id")): skill for skill in skills}
+        for alias in aliases:
+            if str(alias.get("normalized_phrase") or "") != normalized:
+                continue
+            skill = skill_by_id.get(str(alias.get("skill_id") or ""))
+            if skill:
+                matched[str(skill.get("id"))] = (skill, "ALIAS")
+        if len(matched) == 1:
+            skill, matched_by = next(iter(matched.values()))
+            return {
+                "status": "MATCHED",
+                "normalized_phrase": normalized,
+                "matched_by": matched_by,
+                "skill": public_skill(skill),
+            }
+        if len(matched) > 1:
+            return {
+                "status": "AMBIGUOUS",
+                "normalized_phrase": normalized,
+                "matched_by": None,
+                "skill": None,
+                "candidates": [public_skill(item[0]) for item in matched.values()],
+            }
+        return {
+            "status": "NOT_FOUND",
+            "normalized_phrase": normalized,
+            "matched_by": None,
+            "skill": None,
+            "candidates": [],
+        }
+
     @router.get("/skills/{skill_id}")
     async def view_skill(skill_id: str, identity: Any = Depends(current_identity)) -> dict[str, Any]:
         user_id = str(_identity_value(identity, "user_id"))
         skill = await get_skill(skill_id, user_id)
         version = await get_version(skill)
         return {**public_skill(skill), "workflow": version}
+
+    @router.get("/skills/{skill_id}/aliases")
+    async def list_skill_aliases(
+        skill_id: str,
+        identity: Any = Depends(current_identity),
+    ) -> dict[str, Any]:
+        user_id = str(_identity_value(identity, "user_id"))
+        skill = await get_skill(skill_id, user_id)
+        rows = await rest_request(
+            "GET",
+            "lj_skill_triggers",
+            params={
+                "user_id": f"eq.{user_id}",
+                "skill_id": f"eq.{skill['id']}",
+                "select": "id,phrase,normalized_phrase,created_at",
+                "order": "created_at.asc,id.asc",
+                "limit": "20",
+            },
+        ) or []
+        return {"skill_id": skill["id"], "aliases": rows}
+
+    @router.put("/skills/{skill_id}/aliases")
+    async def replace_skill_aliases(
+        skill_id: str,
+        body: SkillAliasesUpdate,
+        identity: Any = Depends(current_identity),
+    ) -> dict[str, Any]:
+        user_id = str(_identity_value(identity, "user_id"))
+        skill = await get_skill(skill_id, user_id)
+        all_skills = await rest_request(
+            "GET",
+            "lj_skills",
+            params={
+                "user_id": f"eq.{user_id}",
+                "deleted_at": "is.null",
+                "select": "id,name",
+                "limit": "200",
+            },
+        ) or []
+        all_aliases = await rest_request(
+            "GET",
+            "lj_skill_triggers",
+            params={
+                "user_id": f"eq.{user_id}",
+                "select": "skill_id,normalized_phrase",
+                "limit": "500",
+            },
+        ) or []
+        requested = [
+            {"phrase": phrase, "normalized_phrase": normalize_skill_phrase(phrase)}
+            for phrase in body.aliases
+        ]
+        for alias in requested:
+            normalized = alias["normalized_phrase"]
+            name_conflict = any(
+                str(item.get("id")) != str(skill["id"])
+                and normalize_skill_phrase(str(item.get("name") or "")) == normalized
+                for item in all_skills
+            )
+            alias_conflict = any(
+                str(item.get("skill_id")) != str(skill["id"])
+                and str(item.get("normalized_phrase") or "") == normalized
+                for item in all_aliases
+            )
+            if name_conflict or alias_conflict:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"The alias '{alias['phrase']}' belongs to another Skill.",
+                )
+        await rpc(
+            "replace_lj_skill_triggers",
+            {
+                "p_user_id": user_id,
+                "p_skill_id": skill["id"],
+                "p_aliases": requested,
+            },
+        )
+        rows = await rest_request(
+            "GET",
+            "lj_skill_triggers",
+            params={
+                "user_id": f"eq.{user_id}",
+                "skill_id": f"eq.{skill['id']}",
+                "select": "id,phrase,normalized_phrase,created_at",
+                "order": "created_at.asc,id.asc",
+                "limit": "20",
+            },
+        ) or []
+        await insert_audit(user_id, "SKILL_ALIASES_UPDATED", {"skill_id": skill["id"], "count": len(rows)})
+        return {"skill_id": skill["id"], "aliases": rows}
 
     @router.patch("/skills/{skill_id}")
     async def edit_skill_metadata(

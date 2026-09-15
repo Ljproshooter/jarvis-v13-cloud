@@ -64,13 +64,16 @@ except ModuleNotFoundError:
 from teach_lj_routes import (
     SemanticStep,
     SafetyPolicy,
+    SkillAliasesUpdate,
     SkillCreate,
+    SkillResolveRequest,
     SkillRunStart,
     SkillVariable,
     build_public_run,
     confirmation_material_facts,
     confirmation_reason,
     create_teach_lj_router,
+    normalize_skill_phrase,
     validate_run_variables,
 )
 
@@ -308,10 +311,31 @@ class TeachLjValidationTests(unittest.TestCase):
         paths = {(route.path, tuple(sorted(route.methods or []))) for route in router.routes}
         self.assertIn(("/v1/skills", ("GET",)), paths)
         self.assertIn(("/v1/skills", ("POST",)), paths)
+        self.assertIn(("/v1/skills/resolve", ("POST",)), paths)
+        self.assertIn(("/v1/skills/{skill_id}/aliases", ("GET",)), paths)
+        self.assertIn(("/v1/skills/{skill_id}/aliases", ("PUT",)), paths)
         self.assertIn(("/v1/skills/{skill_id}/duplicate", ("POST",)), paths)
         self.assertIn(("/v1/skills/{skill_id}/runs", ("POST",)), paths)
         self.assertIn(("/v1/skill-runs/{run_id}/advance", ("POST",)), paths)
         self.assertIn(("/v1/skill-runs/{run_id}/confirm", ("POST",)), paths)
+
+    def test_voice_aliases_are_exact_normalized_and_deduplicated(self) -> None:
+        aliases = SkillAliasesUpdate(
+            aliases=["Open my Music", "open-my music", "Launch Music"]
+        )
+        self.assertEqual(aliases.aliases, ["Open my Music", "Launch Music"])
+        self.assertEqual(normalize_skill_phrase("  Open-my MUSIC!  "), "open my music")
+        request = SkillResolveRequest(phrase="Open my Music")
+        self.assertEqual(request.phrase, "Open my Music")
+
+    def test_backspace_always_needs_confirmation(self) -> None:
+        step = SemanticStep(
+            step_id="erase_one",
+            action="press_key",
+            target={"role": "textbox", "name": "Draft"},
+            arguments={"key": "BACKSPACE"},
+        )
+        self.assertIsNotNone(confirmation_reason(step.model_dump(), {}))
 
     def test_only_running_execute_state_authorizes_device_bound_execution(self) -> None:
         version = {
