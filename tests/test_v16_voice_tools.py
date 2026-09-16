@@ -11,14 +11,14 @@ import main
 
 class V16VoiceToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_old_windows_can_connect_to_install_matching_v16_update(self):
-        for user_agent, expected in (("LJ-AI-Windows/15.9.9", "15.9.9"), ("LJ-AI-Windows/16.0.0", "16.0.0"), ("LJ-AI-Android/15.9.9", "16.0.0"), ("LJ-AI-Android/16.0.0", "16.0.0")):
+        for user_agent, expected in (("LJ-AI-Windows/15.9.9", "15.9.9"), ("LJ-AI-Windows/16.0.0", "16.0.0"), ("LJ-AI-Android/15.9.9", main.APP_VERSION), ("LJ-AI-Android/16.0.0", main.APP_VERSION)):
             with self.subTest(user_agent=user_agent), patch.object(main, "_configured", return_value=True):
                 response = await main.health(Request({
                     "type": "http", "headers": [(b"user-agent", user_agent.encode())],
                 }))
                 self.assertEqual(json.loads(response.body)["version"], expected)
 
-    async def tool_definitions(self, platform, version="16.0.0", snapshot=None):
+    async def tool_definitions(self, platform, version="16.0.0", snapshot=None, include_session=False):
         if snapshot is None:
             snapshot = (
                 f"LJ AI Mobile Android {version}; approved device controls and opt-in screen context available"
@@ -51,7 +51,8 @@ class V16VoiceToolTests(unittest.IsolatedAsyncioTestCase):
             await main.realtime_token(main.RealtimeTokenRequest(
                 client_platform=platform, app_context=snapshot, permission_mode="FULL ACCESS",
             ), identity)
-        return client.post.await_args.kwargs["json"]["session"]["tools"]
+        session = client.post.await_args.kwargs["json"]["session"]
+        return session if include_session else session["tools"]
 
     async def test_both_clients_receive_one_shared_tv_tool_with_exact_controls(self):
         for platform in ("WINDOWS", "ANDROID"):

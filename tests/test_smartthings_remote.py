@@ -326,6 +326,159 @@ class SmartThingsRemoteTests(unittest.IsolatedAsyncioTestCase):
             await self.run_action("REWIND")
         self.assertEqual(self.sent, [])
 
+    async def test_new_samsung_launch_omits_optional_app_objects(self):
+        self.expose("samsungvd.appControl", "launch", [
+            {"name": "appId", "schema": {"type": "string"}},
+            {"name": "appData", "optional": True, "schema": {"type": "object"}},
+            {"name": "launchingOption", "optional": True, "schema": {"type": "object"}},
+        ], component="screen")
+        result = await self.run_action("LAUNCH_APP", "Netflix")
+        self.assertEqual(self.sent[0]["commands"][0], {"component": "screen", "capability": "samsungvd.appControl",
+            "command": "launch", "arguments": ["3201907018807"]})
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["confirmed"])
+
+    async def test_new_launch_resolves_advertised_app_name_and_application_id(self):
+        self.expose("samsungvd.appControl", "launch", [{"name": "appId", "schema": {"type": "string"}}])
+        self.status = {"components": {"main": {"samsungvd.appControl": {"appList": {
+            "value": [{"appName": "My Player", "applicationId": "player-2026"}]
+        }}}}}
+        await self.run_action("LAUNCH_APP", "My Player")
+        self.assertEqual(self.sent[0]["commands"][0]["arguments"], ["player-2026"])
+
+    async def test_ambiguous_advertised_app_ids_do_not_fall_back_to_guessed_id(self):
+        self.expose("custom.launchapp", "launchApp", [{"name": "appId", "schema": {"type": "string"}}])
+        self.status = {"components": {"main": {"custom.launchapp": {"installedApps": {
+            "value": [{"name": "Netflix", "id": "one"}, {"name": "Netflix", "id": "two"}]
+        }}}}}
+        with self.assertRaises(HTTPException):
+            await self.run_action("LAUNCH_APP", "Netflix")
+        self.assertEqual(self.sent, [])
+
+    async def test_unknown_app_name_is_not_sent_as_an_invented_id(self):
+        self.expose("custom.launchapp", "launchApp", [{"name": "appId", "schema": {"type": "string"}}])
+        with self.assertRaises(HTTPException):
+            await self.run_action("LAUNCH_APP", "Unknown Player")
+        self.assertEqual(self.sent, [])
+
+    async def test_required_trailing_launch_argument_is_not_fabricated(self):
+        self.expose("samsungvd.appControl", "launch", [
+            {"name": "appId", "schema": {"type": "string"}},
+            {"name": "mandatoryOptions", "schema": {"type": "object"}},
+        ])
+        with self.assertRaises(HTTPException):
+            await self.run_action("LAUNCH_APP", "Netflix")
+        self.assertEqual(self.sent, [])
+
+    async def test_optional_volume_argument_can_be_omitted(self):
+        self.expose("audioVolume", "volumeUp", [{"name": "transition", "optional": True, "schema": {"type": "integer"}}])
+        await self.run_action("VOLUME_UP", "3x")
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(self.sent[0]["commands"][0]["arguments"], [])
+
+    async def test_scalar_constraints_are_checked_before_command(self):
+        self.expose("mediaInputSource", "setInputSource", [{"name": "input", "schema": {"type": "string", "enum": ["HDMI1"]}}])
+        with self.assertRaises(HTTPException):
+            await self.run_action("SET_INPUT", "HDMI2")
+        self.assertEqual(self.sent, [])
+
+    async def test_samsung_back_uses_declared_bounded_press_release(self):
+        self.expose("samsungvd.remoteControl", "send", [
+            {"name": "key", "schema": {"type": "string", "enum": ["BACK", "OK"]}},
+            {"name": "state", "schema": {"type": "string", "enum": ["PRESSED", "RELEASED", "PRESS_AND_RELEASED"]}},
+        ])
+        result = await self.run_action("BACK")
+        self.assertEqual(self.sent[0]["commands"][0]["arguments"], ["BACK", "PRESS_AND_RELEASED"])
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["confirmed"])
+
+    async def test_samsung_select_maps_to_ok_and_standard_select_remains_select(self):
+        self.expose("samsungvd.remoteControl", "send", [{"name": "key", "schema": {"type": "string", "enum": ["OK"]}}])
+        await self.run_action("SELECT")
+        self.assertEqual(self.sent[0]["commands"][0]["arguments"], ["OK"])
+        self.device["components"][0]["capabilities"] = []
+        self.expose("keypadInput", "sendKey", [{"name": "keyCode", "schema": {"type": "string", "enum": ["SELECT"]}}])
+        await self.run_action("SELECT")
+        self.assertEqual(self.sent[1]["commands"][0]["arguments"], ["SELECT"])
+
+    async def test_unusable_native_schema_selects_standard_keypad_before_sending(self):
+        self.expose("samsungvd.remoteControl", "send", [
+            {"name": "key", "schema": {"type": "string"}},
+            {"name": "state", "schema": {"type": "string", "enum": ["PRESSED", "RELEASED"]}},
+        ])
+        self.expose("keypadInput", "sendKey", [{"name": "keyCode", "schema": {"type": "string", "enum": ["BACK"]}}])
+        await self.run_action("BACK")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]["commands"][0]["capability"], "keypadInput")
+
+    async def test_native_failure_is_never_retried_as_keypad_fallback(self):
+        self.expose("samsungvd.remoteControl", "send", [{"name": "key", "schema": {"type": "string"}}])
+        self.expose("keypadInput", "sendKey", [{"name": "keyCode", "schema": {"type": "string"}}])
+        self.outcomes = [httpx.ReadTimeout("after write")]
+        result = await self.run_action("BACK")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(result["status"], "unknown")
+
+    async def test_current_supported_key_list_is_respected(self):
+        self.expose("keypadInput", "sendKey", [{"name": "keyCode", "schema": {"type": "string", "enum": ["BACK", "HOME"]}}])
+        self.status = {"components": {"main": {"keypadInput": {"supportedKeyCodes": {"value": ["HOME"]}}}}}
+        with self.assertRaises(HTTPException):
+            await self.run_action("BACK")
+        self.assertEqual(self.sent, [])
+
+    async def test_navigation_repeat_count_and_completion_are_honest(self):
+        self.expose("keypadInput", "sendKey", [{"name": "keyCode", "schema": {"type": "string", "enum": ["RIGHT"]}}])
+        self.outcomes = [{"results": [{"status": "COMPLETED"}]}] * 3
+        result = await self.run_action("RIGHT", "3x")
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(result["requested_count"], 3)
+        self.assertFalse(result["confirmed"])
+
+    async def test_rewind_and_fast_forward_repeat_without_time_arguments(self):
+        self.expose("mediaPlayback", "rewind")
+        self.definitions["mediaPlayback"]["commands"]["fastForward"] = {"arguments": []}
+        for action, value in [("REWIND", "3x"), ("FAST_FORWARD", "3 times")]:
+            result = await self.run_action(action, value)
+            self.assertEqual(result["requested_count"], 3)
+            self.assertFalse(result["confirmed"])
+            self.assertIn("button presses", result["message"])
+        self.assertEqual([item["commands"][0]["command"] for item in self.sent], ["rewind"] * 3 + ["fastForward"] * 3)
+        self.assertTrue(all(item["commands"][0]["arguments"] == [] for item in self.sent))
+
+    async def test_unsupported_exact_duration_does_not_become_three_presses(self):
+        self.expose("mediaPlayback", "rewind")
+        for value in ["3 seconds", "3"]:
+            with self.assertRaises(HTTPException):
+                await self.run_action("REWIND", value)
+        self.assertEqual(self.sent, [])
+
+    async def test_seek_repeats_still_obey_current_playback_command_list(self):
+        self.expose("mediaPlayback", "fastForward")
+        self.status = {"components": {"main": {"mediaPlayback": {"supportedPlaybackCommands": {"value": ["play"]}}}}}
+        with self.assertRaises(HTTPException):
+            await self.run_action("FAST_FORWARD", "3x")
+        self.assertEqual(self.sent, [])
+
+    async def test_invalid_repeat_counts_rejected_before_provider_calls(self):
+        for action in ["REWIND", "FAST_FORWARD", "RIGHT", "CHANNEL_UP"]:
+            for value in ["0x", "21x"]:
+                with self.assertRaises(HTTPException):
+                    await self.run_action(action, value)
+        self.mock_client.request.assert_not_called()
+
+    async def test_exact_seek_can_omit_optional_argument_and_use_argument_description_units(self):
+        self.expose("vendor.mediaPlayback", "skipBackward", [
+            {"name": "amount", "description": "Duration in seconds", "schema": {"type": "integer"}},
+            {"name": "mode", "optional": True, "schema": {"type": "string"}},
+        ])
+        await self.run_action("REWIND", "5 seconds")
+        self.assertEqual(self.sent[0]["commands"][0]["arguments"], [5])
+
+    async def test_completed_exact_seek_does_not_claim_observed_distance(self):
+        self.expose("vendor.mediaPlayback", "skipBackward", [{"name": "seconds", "schema": {"type": "integer"}}])
+        self.outcomes = [{"results": [{"status": "COMPLETED"}]}]
+        self.assertFalse((await self.run_action("REWIND", "5 seconds"))["confirmed"])
+
 
 if __name__ == "__main__":
     unittest.main()
