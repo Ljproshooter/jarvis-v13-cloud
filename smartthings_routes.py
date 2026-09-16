@@ -92,6 +92,10 @@ _REMOTE_COMMANDS = {
     "SET_CHANNEL": ("tvChannel", "setTvChannel"), "SET_INPUT": ("mediaInputSource", "setInputSource"),
     "LAUNCH_APP": ("custom.launchapp", "launchApp"),
 }
+_NAVIGATION_ACTIONS = {"BACK", "HOME", "UP", "DOWN", "LEFT", "RIGHT", "SELECT"}
+_REPEAT_ACTIONS = {"VOLUME_UP", "VOLUME_DOWN", "CHANNEL_UP", "CHANNEL_DOWN"} | _NAVIGATION_ACTIONS
+_PLAYBACK_ACTIONS = {"REWIND", "FAST_FORWARD"}
+_LAUNCH_COMMANDS = (("samsungvd.appControl", "launch"), ("custom.launchapp", "launchApp"))
 # SmartThings Developer Support's TV launchApp example uses this Netflix ID.
 # IDs vary across TV generations; an advertised app list always takes precedence.
 # https://community.smartthings.com/t/api-call-tv-app/247068/2
@@ -110,8 +114,46 @@ def _repeat_count(value: str) -> int:
     if not value.strip():
         return 1
     if not match or not 1 <= int(match[1]) <= _MAX_REMOTE_PRESSES:
-        raise HTTPException(422, f"Use between 1 and {_MAX_REMOTE_PRESSES} volume button presses.")
+        raise HTTPException(422, f"Use between 1 and {_MAX_REMOTE_PRESSES} remote button presses.")
     return int(match[1])
+
+
+def _playback_repeats(value: str) -> bool:
+    # Bare numbers remain seconds for compatibility with V16.0.0 clients.
+    return bool(re.fullmatch(r"\s*\d+\s*(?:x|times?|press(?:es)?|steps?)\s*", value, re.I))
+
+
+def _argument_matches(value: Any, schema: dict[str, Any]) -> bool:
+    """Validate the scalar arguments this remote emits; Samsung enforces its schema too."""
+    kind = schema.get("type")
+    if kind == "string":
+        if not isinstance(value, str) or not schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", math.inf):
+            return False
+        if "pattern" in schema:
+            try:
+                if re.search(schema["pattern"], value) is None:
+                    return False
+            except (re.error, TypeError):
+                return False
+    elif kind in {"number", "integer"}:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or _number_for_schema(float(value), schema) is None:
+            return False
+    elif kind == "boolean":
+        if not isinstance(value, bool):
+            return False
+    else:
+        return False
+    return ("enum" not in schema or value in schema["enum"]) and ("const" not in schema or value == schema["const"])
+
+
+def _arguments_match(definition: dict[str, Any], values: list[Any]) -> bool:
+    # Arguments are positional and required by default. Only trailing OPTIONAL
+    # arguments can be omitted; do not invent appData/launchingOption objects.
+    specs = definition.get("arguments") or []
+    return (isinstance(specs, list) and len(values) <= len(specs)
+            and all(isinstance(spec, dict) and spec.get("optional") is True for spec in specs[len(values):])
+            and all(isinstance(spec, dict) and _argument_matches(value, spec.get("schema") or {})
+                    for spec, value in zip(specs, values)))
 
 
 def _duration_seconds(value: str) -> float:
@@ -322,6 +364,54 @@ def create_smartthings_router(
             raise HTTPException(422, f"This device's {capability} capability does not support {command}.")
         return component, commands[command]
 
+    async def navigation_command(device: dict[str, Any], status: dict[str, Any], token: str, action: str) -> dict[str, Any]:
+        # Samsung's native remote and the standard keypad have different SELECT
+        # names. Resolve the command AND argument schema before sending anything.
+        # https://developer.smartthings.com/capabilities/keypadInput
+        # https://community.smartthings.com/t/help-with-basic-advanced-web-app-query/300225
+        for capability, name in (("samsungvd.remoteControl", "send"), ("keypadInput", "sendKey")):
+            try:
+                component, spec = await command_definition(device, capability, name, token)
+            except HTTPException as exc:
+                if exc.status_code == 422:
+                    continue
+                raise
+            key = "OK" if action == "SELECT" and capability == "samsungvd.remoteControl" else action
+            arguments = [key]
+            declared = spec.get("arguments") or []
+            if not declared:
+                continue
+            supported = _attribute(status, component, capability, "supportedKeyCodes").get("value")
+            if isinstance(supported, list) and key not in supported:
+                continue
+            if capability == "samsungvd.remoteControl" and len(declared) > 1:
+                # A bounded press/release must be explicitly declared; never leave
+                # a key held down or synthesize separate press and release calls.
+                mode_schema = declared[1].get("schema") or {}
+                if "PRESS_AND_RELEASED" in (mode_schema.get("enum") or []):
+                    arguments.append("PRESS_AND_RELEASED")
+            if _arguments_match(spec, arguments):
+                return {"component": component, "capability": capability, "command": name, "arguments": arguments}
+        raise HTTPException(422, f"This TV does not expose a usable {action.lower()} button through SmartThings.")
+
+    async def launch_command(device: dict[str, Any], status: dict[str, Any], token: str, wanted: str) -> dict[str, Any]:
+        for capability, name in _LAUNCH_COMMANDS:
+            try:
+                component, spec = await command_definition(device, capability, name, token)
+            except HTTPException as exc:
+                if exc.status_code == 422:
+                    continue
+                raise
+            app_id = advertised_app_id(status, wanted, component) or _TV_APP_IDS.get(_normal(wanted))
+            if app_id is None and re.fullmatch(r"[A-Za-z0-9._-]{1,150}", wanted) and any(char.isdigit() for char in wanted):
+                app_id = wanted  # A caller may supply a known application ID.
+            if app_id is None:
+                raise HTTPException(422, "This TV has not advertised an ID for that app. I can launch an advertised app or a known TV application ID.")
+            arguments = [app_id]
+            if _arguments_match(spec, arguments):
+                return {"component": component, "capability": capability, "command": name, "arguments": arguments}
+        raise HTTPException(422, "This TV does not expose a compatible app-launch command through SmartThings.")
+
     async def timed_seek(device: dict[str, Any], status: dict[str, Any], token: str, action: str, seconds: float) -> dict[str, Any]:
         """Only use a declared time argument with known units, never timed key presses."""
         backwards = action == "REWIND"
@@ -338,10 +428,14 @@ def create_smartthings_router(
                     continue
                 for name, spec in (definition.get("commands") or {}).items():
                     arguments = spec.get("arguments") or []
-                    if len(arguments) != 1 or name not in relative_names | {"seek", "setPlaybackPosition"}:
+                    if not arguments or name not in relative_names | {"seek", "setPlaybackPosition"}:
+                        continue
+                    supported = _attribute(status, component_id, capability_id, "supportedPlaybackCommands").get("value")
+                    if isinstance(supported, list) and name not in supported:
                         continue
                     argument = arguments[0]
-                    schema = argument.get("schema") or {}
+                    schema = dict(argument.get("schema") or {})
+                    schema["description"] = str(argument.get("description") or "") + " " + str(schema.get("description") or "")
                     if name in relative_names:
                         multiplier = _time_multiplier(str(argument.get("name") or ""), schema)
                         raw_value = seconds * multiplier if multiplier else None
@@ -364,23 +458,24 @@ def create_smartthings_router(
                     if raw_value is None:
                         continue
                     value = _number_for_schema(float(raw_value), schema)
-                    if value is not None:
+                    if value is not None and _arguments_match(spec, [value]):
                         return {"component": component_id, "capability": capability_id, "command": name, "arguments": [value]}
         raise HTTPException(422, "This TV/app does not expose exact timed seeking through SmartThings. I cannot reliably rewind or fast-forward that duration with its available remote commands.")
 
-    def advertised_app_id(status: dict[str, Any], wanted: str) -> str | None:
+    def advertised_app_id(status: dict[str, Any], wanted: str, component_id: str) -> str | None:
         matches: set[str] = set()
-        for component in status.get("components", {}).values():
-            for capability in component.values():
-                for attribute in ("supportedApps", "installedApps", "applications", "appList"):
-                    entries = capability.get(attribute, {}).get("value")
-                    if not isinstance(entries, list):
-                        continue
-                    for item in entries:
-                        if isinstance(item, dict) and _normal(item.get("name") or item.get("label")) == _normal(wanted):
-                            app_id = str(item.get("appId") or item.get("id") or "")
-                            if re.fullmatch(r"[A-Za-z0-9._-]{1,150}", app_id):
-                                matches.add(app_id)
+        for capability in status.get("components", {}).get(component_id, {}).values():
+            for attribute in ("supportedApps", "installedApps", "applications", "appList"):
+                entries = capability.get(attribute, {}).get("value")
+                if not isinstance(entries, list):
+                    continue
+                for item in entries:
+                    if isinstance(item, dict) and _normal(item.get("name") or item.get("label") or item.get("appName")) == _normal(wanted):
+                        app_id = str(item.get("appId") or item.get("applicationId") or item.get("id") or "")
+                        if re.fullmatch(r"[A-Za-z0-9._-]{1,150}", app_id):
+                            matches.add(app_id)
+        if len(matches) > 1:
+            raise HTTPException(422, "This TV advertises multiple IDs for that app. Choose its exact application ID.")
         return next(iter(matches)) if len(matches) == 1 else None
 
     def observed_target(status: dict[str, Any], command: dict[str, Any], action: str = "", value: str = "", *, since: datetime) -> bool:
@@ -436,9 +531,12 @@ def create_smartthings_router(
         if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", device_id):
             raise HTTPException(404, "That SmartThings device is unavailable.")
         action, value = body.action.upper().strip(), body.value.strip()
-        if action not in _REMOTE_COMMANDS:
+        if action not in _REMOTE_COMMANDS and action not in _NAVIGATION_ACTIONS:
             raise HTTPException(422, "That SmartThings remote action is not supported.")
-        count = _repeat_count(value) if action in {"VOLUME_UP", "VOLUME_DOWN"} else 1
+        repeated_playback = action in _PLAYBACK_ACTIONS and _playback_repeats(value)
+        timed_playback = action in _PLAYBACK_ACTIONS and bool(value) and not repeated_playback
+        count = _repeat_count(value) if action in _REPEAT_ACTIONS or repeated_playback else 1
+        seconds = _duration_seconds(value) if timed_playback else None
         progress["requested_count"] = count
         # Charge each requested press so a count cannot bypass the command budget.
         for _ in range(count):
@@ -446,40 +544,46 @@ def create_smartthings_router(
         _, token = await connection(identity)
         device = await smartthings_request("GET", f"/devices/{device_id}", token)
         status = await read_status(device_id, token)
-        capability, command_name = _REMOTE_COMMANDS[action]
         arguments: list[Any] = []
-        if action in {"REWIND", "FAST_FORWARD"} and value:
-            seconds = _duration_seconds(value)
+        if timed_playback:
             planned = await timed_seek(device, status, token, action, seconds)
             description = f"{'rewind' if action == 'REWIND' else 'fast-forward'} {seconds:g} seconds"
+        elif action in _NAVIGATION_ACTIONS:
+            planned = await navigation_command(device, status, token, action)
+            description = f"{count} {action.lower()} button press{'es' if count != 1 else ''}"
+        elif action == "LAUNCH_APP":
+            if not re.fullmatch(r"[A-Za-z0-9 ._/-]{1,150}", value):
+                raise HTTPException(422, "Give a valid TV app name or application ID.")
+            planned = await launch_command(device, status, token, value)
+            description = f"launch {value}"
         else:
+            capability, command_name = _REMOTE_COMMANDS[action]
             component, definition = await command_definition(device, capability, command_name, token)
             if action == "SET_VOLUME":
                 if not re.fullmatch(r"\d{1,3}", value) or not 0 <= int(value) <= 100:
                     raise HTTPException(422, "Set TV volume to a whole number from 0 to 100.")
                 arguments = [int(value)]
-            elif action in {"SET_CHANNEL", "SET_INPUT", "LAUNCH_APP"}:
+            elif action in {"SET_CHANNEL", "SET_INPUT"}:
                 if not re.fullmatch(r"[A-Za-z0-9 ._/-]{1,150}", value):
                     raise HTTPException(422, "Give a valid TV app, channel, or input name.")
-                if action == "LAUNCH_APP":
-                    arguments = [advertised_app_id(status, value) or _TV_APP_IDS.get(_normal(value), value)]
-                elif action == "SET_INPUT":
+                if action == "SET_INPUT":
                     compact = re.sub(r"\s+", "", value).lower()
                     arguments = [compact.upper() if re.fullmatch(r"hdmi[1-4]?", compact) else "digitalTv" if compact in {"tv", "digitaltv", "dtv"} else value]
                 else:
                     arguments = [value]
-            elif value and action not in {"VOLUME_UP", "VOLUME_DOWN"}:
+            elif value and action not in _REPEAT_ACTIONS and not repeated_playback:
                 raise HTTPException(422, "This remote button does not accept an extra value.")
-            if len(definition.get("arguments") or []) != len(arguments):
+            if not _arguments_match(definition, arguments):
                 raise HTTPException(422, "This TV exposes a different command format, so I cannot safely use that remote action.")
             # A device may expose mediaPlayback but omit individual playback buttons.
             supported = _attribute(status, component, capability, "supportedPlaybackCommands").get("value")
             if capability == "mediaPlayback" and isinstance(supported, list) and command_name not in supported:
                 raise HTTPException(422, f"The current TV/app does not support {command_name} through SmartThings.")
             planned = {"component": component, "capability": capability, "command": command_name, "arguments": arguments}
-            description = f"{count} volume-{'up' if action == 'VOLUME_UP' else 'down'} press{'es' if count != 1 else ''}" if action in {"VOLUME_UP", "VOLUME_DOWN"} else f"{action.lower().replace('_', ' ')}{(' ' + value) if value else ''}"
+            description = (f"{count} {action.lower().replace('_', '-')} button press{'es' if count != 1 else ''}"
+                           if action in _REPEAT_ACTIONS or repeated_playback else
+                           f"{action.lower().replace('_', ' ')}{(' ' + value) if value else ''}")
         sent = accepted_count = 0
-        provider_completed = True
         command_started = datetime.now(timezone.utc)
         for index in range(count):
             if index:
@@ -490,28 +594,27 @@ def create_smartthings_router(
                 result = await smartthings_request("POST", f"/devices/{device_id}/commands", token, {"commands": [planned]})
             except HTTPException:
                 return {"ok": False, "accepted": accepted_count > 0, "confirmed": False, "status": "unknown",
-                        "requested_count": count, "sent_count": sent,
+                        "requested_count": count, "sent_count": sent, "acknowledged_count": accepted_count,
                         "message": f"The {description} request could not be fully verified; {accepted_count} of {count} commands were acknowledged. The last command may have reached the TV. I did not retry it."}
-            accepted, completed = _provider_outcome(result)
+            accepted, _ = _provider_outcome(result)
             if not accepted:
                 return {"ok": False, "accepted": accepted_count > 0, "confirmed": False, "status": "partial" if accepted_count else "rejected",
-                        "requested_count": count, "sent_count": sent,
+                        "requested_count": count, "sent_count": sent, "acknowledged_count": accepted_count,
                         "message": f"SmartThings did not accept all of the {description} request ({accepted_count} of {count} acknowledged)."}
             accepted_count += 1
             progress["acknowledged_count"] = accepted_count
-            provider_completed = provider_completed and completed
         confirmed = False
-        for attempt in range(3):
+        can_observe = count == 1 and not timed_playback and action not in _NAVIGATION_ACTIONS
+        for attempt in range(3 if can_observe else 0):
             if attempt:
                 await asyncio.sleep(0.35)
             latest = await read_status(device_id, token)
             # 'rewinding' only confirms direction, not a requested duration.
-            if not (action in {"REWIND", "FAST_FORWARD"} and value) and observed_target(latest, planned, action, value, since=command_started):
+            if observed_target(latest, planned, action, value, since=command_started):
                 confirmed = True
                 break
-        # COMPLETED confirms a key press, but cannot prove which application opened.
-        if action != "LAUNCH_APP" and provider_completed:
-            confirmed = True
+        # Provider COMPLETED alone cannot prove the on-screen outcome or an exact
+        # seek distance. Navigation and repeat counts are acknowledgements only.
         label = str(device.get("label") or device.get("name") or "TV")
         if confirmed:
             message = f"{label} reports {value} is open." if action == "LAUNCH_APP" else f"{label} confirmed the {description} command."
@@ -519,7 +622,7 @@ def create_smartthings_router(
             message = f"Sent {description} to {label}. SmartThings accepted it, but the TV has not confirmed the change."
         await audit_device_outcome(identity.user_id, "SMARTTHINGS_REMOTE", {"device_id": device_id, "action": action, "requested_count": count, "sent_count": sent, "confirmed": confirmed})
         return {"ok": True, "accepted": True, "confirmed": confirmed, "status": "confirmed" if confirmed else "accepted",
-                "requested_count": count, "sent_count": sent, "message": message}
+                "requested_count": count, "sent_count": sent, "acknowledged_count": accepted_count, "message": message}
 
     @router.post("/smartthings/connect")
     async def connect(identity: Any = Depends(current_identity)) -> dict[str, Any]:

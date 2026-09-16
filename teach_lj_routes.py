@@ -855,6 +855,7 @@ class SkillResolveRequest(BaseModel):
 class SkillRunStart(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: Literal["TEST", "EXECUTE"] = "EXECUTE"
+    control_mode: Literal["SAFE_MODE", "FULL_ACCESS"] = "SAFE_MODE"
     variables: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("variables")
@@ -937,32 +938,29 @@ def validate_run_variables(schema: list[dict[str, Any]], supplied: dict[str, Any
     return result
 
 
-def confirmation_reason(step: dict[str, Any], safety_policy: dict[str, Any]) -> str | None:
+def confirmation_reason(
+    step: dict[str, Any], safety_policy: dict[str, Any], control_mode: str = "SAFE_MODE",
+) -> str | None:
     action = str(step.get("action") or "")
     arguments = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
-    # Android demonstrations currently describe every tap as click_element.
-    # A label such as Continue, Next, Done, or OK does not prove that the tap is
-    # non-mutating: it can submit a payment, send content, or commit a setting.
-    # Likewise, choosing an option or typing into an auto-save/settings field
-    # may immediately alter externally visible state. Until a trusted recorder
-    # supplies a verifiable non-mutating class, all three actions therefore
-    # require a fresh run-scoped confirmation.
-    if action in {"click_element", "select_option", "set_text"}:
-        return "This recorded interaction may commit a change and always needs confirmation."
-    if action == "press_key":
-        key = str(arguments.get("key") or "").upper()
-        modifiers = {str(item).upper() for item in arguments.get("modifiers", []) if isinstance(item, str)}
-        if key in {"BACKSPACE", "DELETE", "ENTER", "SPACE"}:
-            return "This keyboard action can change or submit the focused control and needs confirmation."
-    if action in RISKY_ACTIONS:
-        return f"{action} is important, external, or irreversible and always needs confirmation."
     target = step.get("target") if isinstance(step.get("target"), dict) else {}
     target_text = " ".join(
         str(target.get(key) or "")
-        for key in ("name", "label", "role", "accessibility_id", "dom_id")
+        for key in ("name", "label", "role", "accessibility_id", "dom_id", "app")
     )
-    if _contains_word(target_text, DANGEROUS_TARGET_WORDS):
-        return "The target looks like it may cause an external or irreversible action."
+    # Full Access is a per-run choice made by the requesting device. It never
+    # turns stored labels, workflows or variables into authorization to send,
+    # pay, delete, execute commands or manipulate sensitive fields.
+    if action in RISKY_ACTIONS:
+        return f"{action} is important, external, or irreversible and always needs confirmation."
+    if _contains_word(target_text, DANGEROUS_TARGET_WORDS | SENSITIVE_WORDS | BLOCKED_COMMAND_SURFACE_WORDS):
+        return "The target looks like it may cause an external, sensitive or irreversible action."
+    if action == "press_key":
+        key = str(arguments.get("key") or "").upper()
+        if key in {"BACKSPACE", "DELETE", "ENTER", "SPACE"}:
+            return "This keyboard action can change or submit the focused control and needs confirmation."
+    if control_mode != "FULL_ACCESS" and action in {"click_element", "select_option", "set_text"}:
+        return "This recorded interaction may commit a change and needs confirmation in Safe Mode."
     return None
 
 
@@ -1044,6 +1042,7 @@ def build_public_run(
         "skill_version": int(run.get("skill_version") or 1),
         "device_id": run.get("device_id"),
         "mode": run.get("mode"),
+        "control_mode": run.get("control_mode") or "SAFE_MODE",
         "status": run.get("status"),
         "state_version": int(run.get("state_version") or 0),
         "current_step_index": index,
@@ -1208,6 +1207,17 @@ def create_teach_lj_router(
                 "SKILL_RUN_AUDIT_WRITE_FAILED",
                 {"skill_id": run["skill_id"], "run_id": run["id"], "event": event_type[:80]},
             )
+
+    async def update_run_summary(skill_id: str, user_id: str, payload: dict[str, Any]) -> None:
+        # The run transition is already committed. This display-only summary
+        # must not turn success into a retryable failure and repeat a UI action.
+        try:
+            await rest_request(
+                "PATCH", "lj_skills", params={"id": f"eq.{skill_id}", "user_id": f"eq.{user_id}"},
+                payload=payload, prefer="return=minimal",
+            )
+        except HTTPException:
+            await insert_audit(user_id, "SKILL_RUN_SUMMARY_WRITE_FAILED", {"skill_id": skill_id})
 
     async def transition_run(
         run: dict[str, Any],
@@ -1733,32 +1743,54 @@ def create_teach_lj_router(
         steps = version.get("steps") if isinstance(version.get("steps"), list) else []
         if not steps:
             raise HTTPException(status_code=409, detail="This Skill has no runnable steps.")
+        control_mode = body.control_mode if body.mode == "EXECUTE" else "SAFE_MODE"
         run_status = "READY" if body.mode == "TEST" else "RUNNING"
         pending: dict[str, Any] | None = None
         token: str | None = None
         token_hash: str | None = None
         expires: str | None = None
         if body.mode == "EXECUTE":
-            reason = confirmation_reason(steps[0], version.get("safety_policy") or {})
+            reason = confirmation_reason(steps[0], version.get("safety_policy") or {}, control_mode)
             if reason:
                 run_status = "WAITING_CONFIRMATION"
                 pending, token, token_hash = make_confirmation(steps[0], 0, reason, variables)
                 expires = pending["expires_at"]
-        result = await rpc(
-            "start_lj_skill_run",
-            {
-                "p_user_id": user_id,
-                "p_skill_id": skill["id"],
-                "p_skill_version": int(version["version"]),
-                "p_device_id": device_id,
-                "p_mode": body.mode,
-                "p_status": run_status,
-                "p_variables": variables,
-                "p_pending_confirmation": pending,
-                "p_confirmation_token_hash": token_hash,
-                "p_confirmation_expires_at": expires,
-            },
-        )
+        start_payload = {
+            "p_user_id": user_id, "p_skill_id": skill["id"],
+            "p_skill_version": int(version["version"]), "p_device_id": device_id,
+            "p_mode": body.mode, "p_status": run_status, "p_variables": variables,
+            "p_pending_confirmation": pending, "p_confirmation_token_hash": token_hash,
+            "p_confirmation_expires_at": expires,
+        }
+        permission_notice = ""
+        if control_mode == "FULL_ACCESS":
+            try:
+                result = await rpc("start_lj_skill_run_v1601", {
+                    **start_payload, "p_control_mode": control_mode,
+                })
+            except HTTPException as exc:
+                if not (exc.status_code == 503 and isinstance(exc.detail, dict)
+                        and exc.detail.get("code") == "teach_run_mode_unavailable"):
+                    raise
+                # The server proved the new function does not exist: no run
+                # was created. Preserve compatibility using Safe Mode only.
+                control_mode = "SAFE_MODE"
+                permission_notice = (
+                    "This Skill is using Safe Mode until the owner applies the V16.0.1 "
+                    "Teach LJ database update. Confirmations are still required."
+                )
+                reason = confirmation_reason(steps[0], version.get("safety_policy") or {})
+                pending = token = token_hash = expires = None
+                run_status = "RUNNING"
+                if reason:
+                    run_status = "WAITING_CONFIRMATION"
+                    pending, token, token_hash = make_confirmation(steps[0], 0, reason, variables)
+                    expires = pending["expires_at"]
+                start_payload.update({"p_status": run_status, "p_pending_confirmation": pending,
+                                      "p_confirmation_token_hash": token_hash, "p_confirmation_expires_at": expires})
+                result = await rpc("start_lj_skill_run", start_payload)
+        else:
+            result = await rpc("start_lj_skill_run", start_payload)
         rows = result if isinstance(result, list) else ([result] if isinstance(result, dict) and result else [])
         if not rows:
             raise HTTPException(status_code=502, detail="The Skill run could not be started.")
@@ -1776,7 +1808,10 @@ def create_teach_lj_router(
             "SKILL_RUN_STARTED",
             {"skill_id": skill["id"], "run_id": run["id"], "mode": body.mode},
         )
-        return public_run(run, version, confirmation_token=token)
+        response = public_run(run, version, confirmation_token=token)
+        if permission_notice:
+            response["permission_notice"] = permission_notice
+        return response
 
     @router.get("/skills/{skill_id}/runs")
     async def list_skill_runs(skill_id: str, identity: Any = Depends(current_identity)) -> dict[str, Any]:
@@ -1853,7 +1888,7 @@ def create_teach_lj_router(
             if run.get("mode") == "EXECUTE" and failure_policy == "ASK_USER":
                 retry_reason = "This step failed. Confirm before LJ tries the same step again."
             elif run.get("mode") == "EXECUTE" and failure_policy == "RETRY":
-                retry_reason = confirmation_reason(steps[index], version.get("safety_policy") or {})
+                retry_reason = confirmation_reason(steps[index], version.get("safety_policy") or {}, str(run.get("control_mode") or "SAFE_MODE"))
             if failure_policy != "STOP":
                 retry_status = "RUNNING" if run.get("mode") == "EXECUTE" else "READY"
                 pending = None
@@ -1895,13 +1930,7 @@ def create_teach_lj_router(
                 completed=True,
             )
             await add_run_event(run, "STEP_FAILED", step_index=index, details={"action": steps[index].get("action")})
-            await rest_request(
-                "PATCH",
-                "lj_skills",
-                params={"id": f"eq.{skill['id']}", "user_id": f"eq.{user_id}"},
-                payload={"last_run_at": now, "last_run_status": "FAILED"},
-                prefer="return=minimal",
-            )
+            await update_run_summary(skill["id"], user_id, {"last_run_at": now, "last_run_status": "FAILED"})
             await insert_audit(user_id, "SKILL_RUN_FAILED", {"skill_id": skill["id"], "run_id": run["id"]})
             return public_run(failed, version)
 
@@ -1919,13 +1948,7 @@ def create_teach_lj_router(
             skill_patch: dict[str, Any] = {"last_run_at": now, "last_run_status": "SUCCEEDED"}
             if run.get("mode") == "EXECUTE":
                 skill_patch["last_used_at"] = now
-            await rest_request(
-                "PATCH",
-                "lj_skills",
-                params={"id": f"eq.{skill['id']}", "user_id": f"eq.{user_id}"},
-                payload=skill_patch,
-                prefer="return=minimal",
-            )
+            await update_run_summary(skill["id"], user_id, skill_patch)
             await add_run_event(run, "RUN_SUCCEEDED", step_index=index)
             await insert_audit(user_id, "SKILL_RUN_SUCCEEDED", {"skill_id": skill["id"], "run_id": run["id"]})
             return public_run(completed, version)
@@ -1937,7 +1960,7 @@ def create_teach_lj_router(
         token_hash = None
         expires = None
         if run.get("mode") == "EXECUTE":
-            reason = confirmation_reason(next_step, version.get("safety_policy") or {})
+            reason = confirmation_reason(next_step, version.get("safety_policy") or {}, str(run.get("control_mode") or "SAFE_MODE"))
             if reason:
                 next_status = "WAITING_CONFIRMATION"
                 pending, token, token_hash = make_confirmation(
@@ -2012,13 +2035,7 @@ def create_teach_lj_router(
         skill = await get_skill(run["skill_id"], user_id, include_deleted=True)
         version = await get_version(skill, int(run["skill_version"]))
         if not body.approved:
-            await rest_request(
-                "PATCH",
-                "lj_skills",
-                params={"id": f"eq.{skill['id']}", "user_id": f"eq.{user_id}"},
-                payload={"last_run_at": now, "last_run_status": "CANCELLED"},
-                prefer="return=minimal",
-            )
+            await update_run_summary(skill["id"], user_id, {"last_run_at": now, "last_run_status": "CANCELLED"})
         await insert_audit(
             user_id,
             "SKILL_CONFIRMATION_APPROVED" if body.approved else "SKILL_CONFIRMATION_DENIED",
@@ -2052,13 +2069,7 @@ def create_teach_lj_router(
         await add_run_event(run, "RUN_CANCELLED", step_index=int(run.get("current_step_index") or 0))
         skill = await get_skill(run["skill_id"], user_id, include_deleted=True)
         version = await get_version(skill, int(run["skill_version"]))
-        await rest_request(
-            "PATCH",
-            "lj_skills",
-            params={"id": f"eq.{skill['id']}", "user_id": f"eq.{user_id}"},
-            payload={"last_run_at": now, "last_run_status": "CANCELLED"},
-            prefer="return=minimal",
-        )
+        await update_run_summary(skill["id"], user_id, {"last_run_at": now, "last_run_status": "CANCELLED"})
         await insert_audit(user_id, "SKILL_RUN_CANCELLED", {"skill_id": skill["id"], "run_id": run["id"]})
         return public_run(cancelled, version)
 
