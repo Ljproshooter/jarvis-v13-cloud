@@ -41,11 +41,29 @@ class CodingProgressTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_reasoning_is_reported_truthfully_without_a_project_deadline(self):
         service, row = self.service(), job()
+        row["state"]["round"] = 3
         row["state"]["response_started_at"] = "2020-01-01T00:00:00+00:00"
         service.api.return_value = {"id": "resp_0123456789", "status":"in_progress", "output":[]}
         await service.step(row)
         self.assertEqual(row["status"], "RUNNING")
-        self.assertIn("no shell commands", row["progress"])
+        self.assertIn("Build step 4:", row["progress"])
+        self.assertIn("no completed commands reported in this step", row["progress"])
+        self.assertNotIn("no shell commands have run", row["progress"])
+        self.assertEqual(row["state"]["round"], 3)
+        self.assertTrue(row["state"]["archive_sha256"])
+
+    async def test_first_ready_build_then_checked_review_delivers_without_extra_build_rounds(self):
+        service, row = self.service(), job()
+        row["state"]["report"] = fixtures.ready_report()
+        await service.step(row)
+        self.assertEqual(row["state"]["phase"], "REVIEW")
+        self.assertEqual(row["state"]["round"], 1)
+        service.env._rpc.assert_not_called()
+        row["state"]["response_id"] = fixtures.RID
+        await service.step(row)
+        self.assertEqual(row["status"], "COMPLETED")
+        self.assertEqual(row["state"]["round"], 2)
+        self.assertEqual(service.env._rpc.call_args.args[0], "finish_lj_coding_job")
 
     async def test_partial_source_survives_missing_model_zip(self):
         service, row = self.service(), job()
