@@ -152,12 +152,18 @@ class ProjectImport(BaseModel):
 CODING_INSTRUCTIONS = """You are LJ AI Developer, an agent building a real project for its owner.
 Follow the user's exact requirements and existing project decisions. Work in /mnt/data/project.
 Inspect and preserve existing files before changing them. Build in manageable steps; persist
-working source files early and after meaningful changes. Each BUILD response implements ONE
-coherent piece, then saves its checkpoint and ends with status continue. The first response
-must create a small runnable version, not just a plan. Start by inspecting the workspace in
+working source files early and after meaningful changes. Each BUILD response implements the
+next outstanding requirements, then saves a checkpoint. A small self-contained request may
+finish implementation in its FIRST response: report status 'ready' as soon as all implementable
+user requirements are satisfied. Report 'continue' only when specific implementation work or
+failed checks remain, and name that work in next_steps. There is no minimum number of build
+steps. Do not invent extra features, optional polish or new test rounds merely to keep working.
+The first response must create a small runnable version, not just a plan. Start by inspecting the workspace in
 the shell; do not design the entire project before the first tool call. Write complete files
 in small batches instead of constructing the whole application in one enormous command.
-Use roughly 3-6 shell calls per BUILD step, including checkpointing. Later steps add the
+For work that needs more than one response, aim for roughly 3-6 shell calls per BUILD step,
+including checkpointing; this is guidance, not a minimum or a reason to split a finished task.
+Later steps add the
 remaining requirements without discarding earlier work. This is a step size, not a project
 size limit: all user requirements stay in REQUIREMENTS.md until implemented and checked.
 Do not reply with an unfinished code
@@ -176,6 +182,10 @@ Write meaningful tests for behavior and run available syntax/build/runtime check
 apps, use an available headless browser to check startup, console errors and key interactions.
 Fix failures and rerun relevant checks. Distinguish executed tests from code review and checks
 that require the user's target platform. Never claim perfection or a check you did not run.
+After the requested behaviour is implemented and relevant available checks pass, proceed to
+delivery. Record unavailable target-platform checks as limitations with exact user test steps;
+do not keep repeating blocked checks. A genuine blocker to implementing the request needs input.
+REVIEW validates the requested deliverable and fixes concrete failures; it does not expand scope.
 Checkpoint after each meaningful implementation step, and before ending EVERY response:
 package /mnt/data/project into /mnt/data/lj_project.zip
 (relative paths, no symlinks, no installed dependencies, caches, credentials or .git directory)
@@ -435,11 +445,19 @@ class CodingService:
         history, memories, _enabled = await self.env._canonical_chat_context(
             identity, job["conversation_id"], job["prompt"])
         phase = state.get("phase", "BUILD")
-        guidance = "Implement the next small runnable piece, save its source and checkpoint, then end this step."
+        guidance = (
+            "Inspect the saved project and finish only outstanding user requirements or concrete failures. "
+            "When the requested implementation and relevant available checks are complete, save the ZIP/report "
+            "with status ready now, even on the first BUILD step. This hands the project to final REVIEW. "
+            "Use continue only for named unfinished work; do not add another round just for optional polish. "
+            "Record unavailable platform checks as limitations instead of repeating them.")
         if phase == "REVIEW":
             guidance = ("Review the implemented project against EVERY requirement. Execute meaningful checks in the shell, "
                 "fix all failures you can reproduce, and rerun checks. Inspect for incomplete files, placeholders and "
-                "broken imports. Keep working if anything is missing. Regenerate the ZIP and progress JSON after fixes.")
+                "broken imports. Continue only for missing requested behaviour or concrete failures. "
+                "Record unavailable platform checks as limitations rather than repeating blocked attempts. "
+                "If the implementation is complete and the relevant available checks pass, regenerate the ZIP "
+                "and matching progress JSON with status ready in this response so the worker can deliver it.")
         if state.get("restore_path"):
             guidance += " Restore the saved source ZIP " + json.dumps(state["restore_path"]) + " into /mnt/data/project first."
         if state.get("report"):
@@ -564,9 +582,10 @@ class CodingService:
             elif evidence:
                 activity = f"{len(evidence)} commands finished; preparing the next change"
             else:
-                activity = "Model is reasoning; no shell commands have run yet"
+                activity = "Waiting for model output; no completed commands reported in this step"
             state["activity"] = activity
-            progress = activity
+            phase_label = "Review" if state.get("phase") == "REVIEW" else "Build"
+            progress = f"{phase_label} step {int(state.get('round', 0)) + 1}: {activity}"
             if not calls and state.get("response_started_at"):
                 elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(state["response_started_at"])).total_seconds()
                 if elapsed >= 120:

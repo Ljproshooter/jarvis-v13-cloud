@@ -2,6 +2,14 @@
 
 This continues your published V16.0.4. Both new apps are **16.0.5**; Android's version code is **16005**. **No new Supabase SQL or new secret is required.** Keep the completed database and memory setup.
 
+## Coding completion follow-up
+
+The Windows device test produced saved game files and passing-check reports, but showed repeated BUILD rounds. A conflicting instruction required every BUILD response to report `continue`, while the worker waits for `ready` before final review. The cloud follow-up removes that conflict: a small completed implementation can request review after its first build step, and continued work must identify an unfinished requirement or concrete failure. Unavailable platform checks are recorded as limitations rather than repeated indefinitely. Final review and verification of executed checks remain required; no project deadline or minimum number of build rounds is added.
+
+Progress now names the current build/review step and says when no completed commands have been reported for that step. A zero count on a new step does not mean the previously saved files were lost. This correction is cloud-only: keep the already built V16.0.5 Windows app and the supplied Android source package. Merge the follow-up cloud PR and wait for Render Live. An already submitted provider request keeps its original instructions; the next new step uses the corrected instructions. Leave an active job running rather than repeatedly restarting it. No update JSON, release asset, Render environment value or database change is needed for this correction.
+
+The cloud regression suite passes 255 tests plus 102 subtests with this follow-up. A live generation still needs to reach COMPLETED and its downloaded source must be tried on the requested target; these tests do not establish a model response-time guarantee.
+
 ## What changed
 
 **Coding:** the cloud now asks GPT-6 Astra to implement and checkpoint small runnable pieces. Build steps use high reasoning; final review uses maximum reasoning on the same model. There is no overall project deadline. Provider queue state, completed commands and the last cloud check are shown separately from completed steps. If the model has written source but has not packaged its ZIP, the worker can recover an initial source snapshot. Only a matching report and verified executed checks can finish a project. Source ZIP import/export, Stop/Resume, continuation, memory and Normal/Smart direct replies remain.
