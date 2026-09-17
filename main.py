@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V16 Cloud"
-APP_VERSION = "16.0.3"
+APP_VERSION = "16.0.4"
 LJ_AI_WEBSITE = "https://lj-ai-official-site.pages.dev/"
 
 # V15.9.x Windows clients may require /health to report their exact
@@ -3843,10 +3843,16 @@ async def chat(
             payload["service_tier"] = "fast"
 
     if coding_request and identity.effective_plan in {"VIP", "ADMIN"} and not body.from_voice:
-        payload["max_output_tokens"] = max(int(payload["max_output_tokens"]), 1800)
+        # Output budgets include reasoning. The old 1,800-token floor could
+        # exhaust even a simple program before the model supplied its code.
+        coding_budget = {"NORMAL": 8192, "SMART": 16384, "DEEP_THINK": 32768, "DEVELOPER": 65536}[ai_mode]
+        payload["max_output_tokens"] = max(int(payload["max_output_tokens"]), coding_budget)
         payload["instructions"] += (
             f"\nThis is a coding request using {AI_MODE_LABELS[ai_mode]} mode for a VIP or Administrator account. Diagnose before changing code, "
-            "preserve working behaviour, call out security-sensitive assumptions, and include a practical verification step."
+            "preserve working behaviour, and include a practical verification step. "
+            "Prioritise complete runnable code over a long explanation. Do not replace required code with placeholders. "
+            "For JS Bin, provide complete HTML/CSS/JavaScript with no build step unless requested. "
+            "Only claim execution or testing when tool results confirm it."
         )
     if ai_mode == "DEVELOPER" and not body.from_voice:
         payload["instructions"] += (
@@ -4829,6 +4835,24 @@ def _app_action_tools(body: RealtimeTokenRequest, identity: Identity) -> list[di
                     "GET_CAPABILITIES reports current support/permissions. Follow an actual missing-permission result with the "
                     "appropriate settings action; never claim an action succeeded without the local result. "
                     "Use empty strings for irrelevant target, screen, message and platform fields."
+                )
+    if _realtime_client_version(body) >= (16, 0, 4):
+        for tool in tools:
+            if tool["name"] == "control_smartthings":
+                tool["parameters"]["properties"]["action"]["enum"].extend(["SEARCH_NETFLIX", "SEARCH_YOUTUBE"])
+                tool["description"] += (
+                    " Once/twice/thrice mean 1/2/3 presses; 'go right twice' uses RIGHT with value '2x'. "
+                    "SEARCH_NETFLIX/SEARCH_YOUTUBE use value as the exact search query, and only when the user explicitly says on the TV. "
+                    "Search support must be advertised by the device; do not claim results when the tool reports unsupported. "
+                    "Search on the phone uses control_android_device instead."
+                )
+            elif tool["name"] == "control_android_device":
+                tool["parameters"]["properties"]["action"]["enum"].append("SEARCH_MEDIA")
+                tool["description"] += (
+                    " SEARCH_MEDIA opens an explicit Netflix or YouTube query on this phone. "
+                    "The client derives platform/query from the user's words. CALL_CONTACT places the requested phone call "
+                    "after permissions and any Safe Mode approval, then releases LJ's microphone; it does not talk for the user. "
+                    "Messages are prepared for review; never report sent unless the client confirms a separate Send action."
                 )
     return tools
 

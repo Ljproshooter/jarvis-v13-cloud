@@ -95,6 +95,43 @@ class SmartThingsRemoteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "accepted")
         self.assertIn("has not confirmed", result["message"])
 
+    async def test_twice_sends_exactly_two_separate_right_presses(self):
+        self.expose("keypadInput", "sendKey", [{"name": "keyCode", "schema": {"type": "string", "enum": ["RIGHT"]}}])
+        result = await self.run_action("RIGHT", "twice")
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(result["requested_count"], 2)
+        self.assertFalse(result["confirmed"])
+
+    async def test_fast_forward_falls_back_only_to_an_advertised_transport_key(self):
+        self.expose("samsungvd.remoteControl", "send", [{"name": "key", "schema": {"type": "string", "enum": ["FAST_FORWARD"]}}])
+        result = await self.run_action("FAST_FORWARD", "3x")
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(self.sent[0]["commands"][0]["arguments"], ["FAST_FORWARD"])
+        self.assertFalse(result["confirmed"])
+
+    async def test_transport_key_is_never_guessed_from_a_free_form_remote(self):
+        self.expose("keypadInput", "sendKey", [{"name": "keyCode", "schema": {"type": "string"}}])
+        with self.assertRaises(HTTPException) as raised:
+            await self.run_action("FAST_FORWARD", "3x")
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertFalse(self.sent)
+
+    async def test_tv_search_never_claims_support_or_launches_an_unrelated_app(self):
+        self.expose("custom.launchapp", "launchApp", [{"name": "appId", "schema": {"type": "string"}}])
+        with self.assertRaises(HTTPException) as raised:
+            await self.run_action("SEARCH_NETFLIX", "Stranger Things")
+        self.assertIn("does not advertise", raised.exception.detail)
+        self.assertFalse(self.sent)
+
+    async def test_search_uses_only_the_advertised_app_scoped_schema(self):
+        self.expose("example.mediaSearch", "searchContent", [
+            {"name": "app", "schema": {"type": "string", "enum": ["Netflix", "YouTube"]}},
+            {"name": "query", "schema": {"type": "string"}},
+        ])
+        result = await self.run_action("SEARCH_NETFLIX", "Stranger Things")
+        self.assertEqual(self.sent[0]["commands"][0]["arguments"], ["Netflix", "Stranger Things"])
+        self.assertFalse(result["confirmed"])
+
     async def test_device_advertised_netflix_id_overrides_default_on_correct_component(self):
         self.expose("custom.launchapp", "launchApp", [{"name": "appId", "schema": {"type": "string"}}], component="screen")
         self.status = {"components": {"screen": {"custom.launchapp": {

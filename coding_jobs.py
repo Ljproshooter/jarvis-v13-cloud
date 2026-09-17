@@ -271,6 +271,8 @@ class CodingService:
             "updated_at": job["updated_at"], "round": state.get("round", 0),
             "phase": state.get("phase", "BUILD"), "reply": state.get("reply", ""),
             "model": state.get("model", ""), "tests": state.get("report", {}).get("tests", ""),
+            "provider_status": state.get("provider_status", ""),
+            "provider_error_code": state.get("provider_error_code", ""),
             "limitations": state.get("report", {}).get("limitations", ""),
             "has_project": bool(state.get("archive_sha256")), "sha256": state.get("archive_sha256", ""),
             "files": state.get("manifest", []), "history_saved": job["status"] == "COMPLETED"}
@@ -430,7 +432,9 @@ class CodingService:
                 progress += " Resume starts a fresh step from saved files; the interrupted model request may still be running."
             await self.save(job, state=state, status="PAUSED", progress=progress)
             return
-        state.update(response_id=identifier(response.get("id"), "resp_"), submitting=False, restore_path=None)
+        state.update(response_id=identifier(response.get("id"), "resp_"), submitting=False, restore_path=None,
+            model=str(response.get("model") or self.env.OPENAI_TEXT_DEVELOPER_MODEL),
+            provider_status=str(response.get("status") or "queued"), provider_error_code="")
         # A Stop arriving during POST must retain the returned ID so the next
         # worker can cancel it. Ordinary state writes remain status-conditional.
         rows = await self.env._rest_request("PATCH", "lj_coding_jobs", params={
@@ -465,7 +469,9 @@ class CodingService:
                     await self.checkpoint(job)
             state.update(response_id=None, previous_response_id=None, submitting=False,
                          container_id=None, restore_pending=False)
-            await self.save(job, state=state, status="STOPPED", progress="Stopped. Your last saved project is available.")
+            progress = ("Stopped. Your last saved project is available." if state.get("archive_sha256")
+                else "Stopped before the first project files were saved. Resume to continue.")
+            await self.save(job, state=state, status="STOPPED", progress=progress)
             return
         identity = await self.identity(job)
         if not state.get("response_id"):
@@ -481,11 +487,13 @@ class CodingService:
             await self.save(job, state=state, progress="Restoring saved project files after the model session expired")
             return
         status = response.get("status")
+        state["provider_status"] = str(status or "unknown")
+        state["model"] = str(response.get("model") or state.get("model") or self.env.OPENAI_TEXT_DEVELOPER_MODEL)
         if status in {"queued", "in_progress"}:
             # Persist provider/tool progress without manufacturing percentage estimates.
             evidence = shell_evidence(response)
             progress = "Running project commands and checks" if evidence else "Thinking and building your project"
-            await self.save(job, progress=progress)
+            await self.save(job, state=state, progress=progress)
             # Provider containers are ephemeral; periodically save available checkpoints.
             if time.time() - float(state.get("last_checkpoint", 0)) > 45:
                 with suppress(HTTPException, ValueError, json.JSONDecodeError):
@@ -498,6 +506,8 @@ class CodingService:
                 await self.checkpoint(job)
             state["response_id"] = None
             provider_code = (response.get("error") or {}).get("code")
+            # Expose the provider's error category, never its raw request/body.
+            state["provider_error_code"] = str(provider_code or "unknown")[:80] if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(provider_code or "unknown")) else "unknown"
             if status == "failed" and provider_code in {"server_error", "rate_limit_exceeded"}:
                 state["provider_failures"] = int(state.get("provider_failures", 0)) + 1
                 state["previous_response_id"] = None
@@ -505,8 +515,13 @@ class CodingService:
                     await self.save(job, state=state, progress="The model service interrupted this step. Retrying from saved files.",
                         next_run_at=(datetime.now(timezone.utc)+timedelta(seconds=30)).isoformat())
                     return
-            await self.save(job, state=state, status="PAUSED",
-                progress="The model stopped before finishing. Your saved project is retained; Resume will continue it.")
+            reason = state["provider_error_code"]
+            progress = {
+                "insufficient_quota": "The AI provider account has no available credit. The app owner must check API billing before Resume.",
+                "model_not_found": "The configured coding model is unavailable to the API account. The app owner must check model access.",
+                "invalid_request_error": "The AI provider rejected the coding request settings. The app owner must check the cloud logs.",
+            }.get(reason, f"The AI provider stopped this step ({reason}). Open Coding Projects for saved files and Resume.")
+            await self.save(job, state=state, status="PAUSED", progress=progress)
             return
         if status == "incomplete" and (response.get("incomplete_details") or {}).get("reason") == "content_filter":
             state["response_id"] = None

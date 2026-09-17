@@ -95,6 +95,7 @@ _REMOTE_COMMANDS = {
 _NAVIGATION_ACTIONS = {"BACK", "HOME", "UP", "DOWN", "LEFT", "RIGHT", "SELECT"}
 _REPEAT_ACTIONS = {"VOLUME_UP", "VOLUME_DOWN", "CHANNEL_UP", "CHANNEL_DOWN"} | _NAVIGATION_ACTIONS
 _PLAYBACK_ACTIONS = {"REWIND", "FAST_FORWARD"}
+_SEARCH_ACTIONS = {"SEARCH_NETFLIX": "netflix", "SEARCH_YOUTUBE": "youtube"}
 _LAUNCH_COMMANDS = (("samsungvd.appControl", "launch"), ("custom.launchapp", "launchApp"))
 # SmartThings Developer Support's TV launchApp example uses this Netflix ID.
 # IDs vary across TV generations; an advertised app list always takes precedence.
@@ -110,6 +111,7 @@ def _normal(value: Any) -> str:
 
 
 def _repeat_count(value: str) -> int:
+    value = {"once": "1x", "twice": "2x", "thrice": "3x"}.get(value.strip().lower(), value)
     match = re.fullmatch(r"\s*(\d+)\s*(?:x|times?|press(?:es)?|steps?)?\s*", value, re.I)
     if not value.strip():
         return 1
@@ -120,7 +122,7 @@ def _repeat_count(value: str) -> int:
 
 def _playback_repeats(value: str) -> bool:
     # Bare numbers remain seconds for compatibility with V16.0.0 clients.
-    return bool(re.fullmatch(r"\s*\d+\s*(?:x|times?|press(?:es)?|steps?)\s*", value, re.I))
+    return value.strip().lower() in {"once", "twice", "thrice"} or bool(re.fullmatch(r"\s*\d+\s*(?:x|times?|press(?:es)?|steps?)\s*", value, re.I))
 
 
 def _argument_matches(value: Any, schema: dict[str, Any]) -> bool:
@@ -377,13 +379,19 @@ def create_smartthings_router(
                     continue
                 raise
             key = "OK" if action == "SELECT" and capability == "samsungvd.remoteControl" else action
-            arguments = [key]
             declared = spec.get("arguments") or []
             if not declared:
                 continue
             supported = _attribute(status, component, capability, "supportedKeyCodes").get("value")
+            if action in _PLAYBACK_ACTIONS:
+                advertised = supported if isinstance(supported, list) else (declared[0].get("schema") or {}).get("enum", [])
+                candidates = ("FAST_FORWARD", "FASTFORWARD", "FF") if action == "FAST_FORWARD" else ("REWIND", "REW")
+                key = next((candidate for candidate in candidates if candidate in advertised), "")
+                if not key:
+                    continue
             if isinstance(supported, list) and key not in supported:
                 continue
+            arguments = [key]
             if capability == "samsungvd.remoteControl" and len(declared) > 1:
                 # A bounded press/release must be explicitly declared; never leave
                 # a key held down or synthesize separate press and release calls.
@@ -393,6 +401,20 @@ def create_smartthings_router(
             if _arguments_match(spec, arguments):
                 return {"component": component, "capability": capability, "command": name, "arguments": arguments}
         raise HTTPException(422, f"This TV does not expose a usable {action.lower()} button through SmartThings.")
+
+    async def playback_command(device: dict[str, Any], status: dict[str, Any], token: str, action: str) -> dict[str, Any]:
+        capability, name = _REMOTE_COMMANDS[action]
+        try:
+            component, spec = await command_definition(device, capability, name, token)
+            supported = _attribute(status, component, capability, "supportedPlaybackCommands").get("value")
+            if _arguments_match(spec, []) and (not isinstance(supported, list) or name in supported):
+                return {"component": component, "capability": capability, "command": name, "arguments": []}
+        except HTTPException as error:
+            if error.status_code != 422:
+                raise
+        # Resolve a supported transport key before sending anything. An
+        # uncertain or rejected physical command is never automatically retried.
+        return await navigation_command(device, status, token, action)
 
     async def launch_command(device: dict[str, Any], status: dict[str, Any], token: str, wanted: str) -> dict[str, Any]:
         for capability, name in _LAUNCH_COMMANDS:
@@ -411,6 +433,42 @@ def create_smartthings_router(
             if _arguments_match(spec, arguments):
                 return {"component": component, "capability": capability, "command": name, "arguments": arguments}
         raise HTTPException(422, "This TV does not expose a compatible app-launch command through SmartThings.")
+
+    async def search_command(device: dict[str, Any], token: str, platform: str, query: str) -> dict[str, Any]:
+        if not 1 <= len(query) <= 260 or any(ord(char) < 32 for char in query):
+            raise HTTPException(422, "Give the movie, show or video title to search for.")
+        # There is no universal SmartThings Netflix/YouTube search command.
+        # Only use an app-scoped search explicitly advertised by this TV.
+        for component in device.get("components", []):
+            for capability in component.get("capabilities", []):
+                cap = str(capability.get("id") or "")
+                if "search" not in cap.lower() or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", cap):
+                    continue
+                for name in ("search", "searchContent"):
+                    try:
+                        part, spec = await command_definition(device, cap, name, token)
+                    except HTTPException as error:
+                        if error.status_code == 422:
+                            continue
+                        raise
+                    arguments = []
+                    scoped = platform in cap.lower()
+                    has_query = False
+                    for argument in spec.get("arguments") or []:
+                        key = str(argument.get("name") or "").lower()
+                        if key in {"query", "searchquery", "searchterm", "text"}:
+                            arguments.append(query)
+                            has_query = True
+                        elif key in {"app", "appname", "application", "provider", "service"}:
+                            enum = (argument.get("schema") or {}).get("enum") or []
+                            arguments.append(next((item for item in enum if str(item).lower() == platform), platform))
+                            scoped = True
+                        else:
+                            break
+                    else:
+                        if scoped and has_query and _arguments_match(spec, arguments):
+                            return {"component": part, "capability": cap, "command": name, "arguments": arguments}
+        raise HTTPException(422, f"This TV does not advertise {platform.title()} content search through SmartThings. I can open the TV app and navigate with its supported remote buttons. To search on your phone, say 'search {platform} for {query}' without 'on the TV'.")
 
     async def timed_seek(device: dict[str, Any], status: dict[str, Any], token: str, action: str, seconds: float) -> dict[str, Any]:
         """Only use a declared time argument with known units, never timed key presses."""
@@ -531,7 +589,7 @@ def create_smartthings_router(
         if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", device_id):
             raise HTTPException(404, "That SmartThings device is unavailable.")
         action, value = body.action.upper().strip(), body.value.strip()
-        if action not in _REMOTE_COMMANDS and action not in _NAVIGATION_ACTIONS:
+        if action not in _REMOTE_COMMANDS and action not in _NAVIGATION_ACTIONS and action not in _SEARCH_ACTIONS:
             raise HTTPException(422, "That SmartThings remote action is not supported.")
         repeated_playback = action in _PLAYBACK_ACTIONS and _playback_repeats(value)
         timed_playback = action in _PLAYBACK_ACTIONS and bool(value) and not repeated_playback
@@ -545,12 +603,18 @@ def create_smartthings_router(
         device = await smartthings_request("GET", f"/devices/{device_id}", token)
         status = await read_status(device_id, token)
         arguments: list[Any] = []
-        if timed_playback:
+        if action in _SEARCH_ACTIONS:
+            planned = await search_command(device, token, _SEARCH_ACTIONS[action], value)
+            description = f"search {_SEARCH_ACTIONS[action]} for {value}"
+        elif timed_playback:
             planned = await timed_seek(device, status, token, action, seconds)
             description = f"{'rewind' if action == 'REWIND' else 'fast-forward'} {seconds:g} seconds"
         elif action in _NAVIGATION_ACTIONS:
             planned = await navigation_command(device, status, token, action)
             description = f"{count} {action.lower()} button press{'es' if count != 1 else ''}"
+        elif action in _PLAYBACK_ACTIONS:
+            planned = await playback_command(device, status, token, action)
+            description = f"{count} {action.lower().replace('_', '-')} button press{'es' if count != 1 else ''}"
         elif action == "LAUNCH_APP":
             if not re.fullmatch(r"[A-Za-z0-9 ._/-]{1,150}", value):
                 raise HTTPException(422, "Give a valid TV app name or application ID.")
@@ -587,7 +651,8 @@ def create_smartthings_router(
         command_started = datetime.now(timezone.utc)
         for index in range(count):
             if index:
-                await asyncio.sleep(0.12)
+                # TVs commonly coalesce quick consecutive navigation/seek keys.
+                await asyncio.sleep(0.45 if action in _PLAYBACK_ACTIONS else 0.3)
             sent += 1
             progress["sent_count"] = sent
             try:
@@ -604,7 +669,7 @@ def create_smartthings_router(
             accepted_count += 1
             progress["acknowledged_count"] = accepted_count
         confirmed = False
-        can_observe = count == 1 and not timed_playback and action not in _NAVIGATION_ACTIONS
+        can_observe = count == 1 and not timed_playback and action not in _NAVIGATION_ACTIONS and action not in _SEARCH_ACTIONS
         for attempt in range(3 if can_observe else 0):
             if attempt:
                 await asyncio.sleep(0.35)
