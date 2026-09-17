@@ -157,7 +157,7 @@ class VoiceAndWebUsageSecurityTests(unittest.IsolatedAsyncioTestCase):
 
     def test_public_release_gate_discloses_direct_realtime_limit(self) -> None:
         gates = (
-            Path(__file__).resolve().parents[2] / "PUBLIC_RELEASE_OPERATIONAL_GATES.md"
+            Path(__file__).resolve().parents[1] / "PUBLIC_RELEASE_OPERATIONAL_GATES.md"
         ).read_text().casefold()
         self.assertIn("realtime voice quota enforcement (public-launch blocker)", gates)
         self.assertIn("does not stop a session already started", gates)
@@ -1364,6 +1364,8 @@ class OpenAIBackgroundModeTests(unittest.IsolatedAsyncioTestCase):
         payload = background_call.await_args.args[0]
         self.assertEqual(payload["model"], main.OPENAI_TEXT_DEVELOPER_MODEL)
         self.assertEqual(payload["reasoning"], {"effort": "max"})
+        self.assertEqual(payload["max_output_tokens"], 65536)
+        self.assertEqual(payload["model"], "gpt-6-astra")
         self.assertEqual(payload["service_tier"], "fast")
         self.assertEqual(background_call.await_args.args[1], "Developer / Coding")
         ordinary_call.assert_not_awaited()
@@ -1761,3 +1763,4 @@ class MobileUpdateMetadataTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
