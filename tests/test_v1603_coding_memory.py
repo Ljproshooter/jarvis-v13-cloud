@@ -271,7 +271,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.api.call_args.args[:2],("POST","containers/"+CID+"/files"))
         self.assertFalse(row["state"]["restore_pending"])
 
-    async def test_new_response_has_background_max_reasoning_and_isolated_shell(self):
+    async def test_new_response_has_background_incremental_reasoning_and_isolated_shell(self):
         service, row = self.service(), job()
         row["state"].update(response_id=None)
         service.ensure_container = AsyncMock()
@@ -279,7 +279,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         await service.begin_response(row,SimpleNamespace(user_id=OWNER))
         payload = service.api.call_args.args[2]
         self.assertTrue(payload["background"])
-        self.assertEqual(payload["reasoning"]["effort"],"max")
+        self.assertEqual(payload["reasoning"]["effort"],"high")
         self.assertEqual(payload["model"],"gpt-6-astra")
         self.assertEqual(payload["tools"][0]["environment"]["type"],"container_reference")
         self.assertNotIn("network_policy",json.dumps(payload))

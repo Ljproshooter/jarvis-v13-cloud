@@ -152,7 +152,15 @@ class ProjectImport(BaseModel):
 CODING_INSTRUCTIONS = """You are LJ AI Developer, an agent building a real project for its owner.
 Follow the user's exact requirements and existing project decisions. Work in /mnt/data/project.
 Inspect and preserve existing files before changing them. Build in manageable steps; persist
-working source files early and after meaningful changes. Do not reply with an unfinished code
+working source files early and after meaningful changes. Each BUILD response implements ONE
+coherent piece, then saves its checkpoint and ends with status continue. The first response
+must create a small runnable version, not just a plan. Start by inspecting the workspace in
+the shell; do not design the entire project before the first tool call. Write complete files
+in small batches instead of constructing the whole application in one enormous command.
+Use roughly 3-6 shell calls per BUILD step, including checkpointing. Later steps add the
+remaining requirements without discarding earlier work. This is a step size, not a project
+size limit: all user requirements stay in REQUIREMENTS.md until implemented and checked.
+Do not reply with an unfinished code
 block as a completed deliverable. No overall job time limit is imposed by LJ AI; another turn
 will be scheduled when this response fills up. Keep each individual command bounded so Stop works.
 Use your hosted shell to run commands and verify claims. You cannot access the user's PC,
@@ -273,6 +281,11 @@ class CodingService:
             "model": state.get("model", ""), "tests": state.get("report", {}).get("tests", ""),
             "provider_status": state.get("provider_status", ""),
             "provider_error_code": state.get("provider_error_code", ""),
+            "commands_completed": state.get("commands_completed", 0),
+            "activity": state.get("activity", ""),
+            "response_started_at": state.get("response_started_at", ""),
+            "last_checked_at": state.get("last_checked_at", ""),
+            "reasoning_effort": state.get("reasoning_effort", ""),
             "limitations": state.get("report", {}).get("limitations", ""),
             "has_project": bool(state.get("archive_sha256")), "sha256": state.get("archive_sha256", ""),
             "files": state.get("manifest", []), "history_saved": job["status"] == "COMPLETED"}
@@ -334,8 +347,44 @@ class CodingService:
                          and raw_report.get("archive_sha256") == hashlib.sha256(data).hexdigest())
             if fresh:
                 state["report"] = raw_report
-            await self.persist_archive(job, data)
+            if fresh or not state.get("archive_sha256"):
+                await self.persist_archive(job, data)
+        elif not state.get("archive_sha256"):
+            # The model may reach its response budget before creating a ZIP. Recover
+            # real source files rather than repeating an empty step indefinitely.
+            # This snapshot never counts as a ready/tested report.
+            await self.snapshot_sources(job, files)
         return fresh
+
+    async def snapshot_sources(self, job, files):
+        candidates = {}
+        ignored = {"node_modules", ".git", ".venv", "venv", "__pycache__", ".gradle", "build", "dist"}
+        for item in files:
+            path = str(item.get("path") or "")
+            if not path.startswith("/mnt/data/project/"):
+                continue
+            name = path[len("/mnt/data/project/"):]
+            parts = PurePosixPath(name).parts
+            if not parts or any(p in ignored or p.startswith(".env") for p in parts):
+                continue
+            if name.endswith((".pem", ".key", ".p12", ".jks", ".keystore", "/")):
+                continue
+            if int(item.get("bytes") or 0) > 4 * 1024 * 1024:
+                continue
+            candidates[name] = item
+        if not candidates or len(candidates) > 200:
+            return
+        stream, total = io.BytesIO(), 0
+        cid = identifier(job["state"]["container_id"], "cntr_")
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, item in candidates.items():
+                fid = identifier(item.get("id"), "cfile_")
+                raw = await self.api("GET", f"containers/{cid}/files/{fid}/content", binary=True)
+                total += len(raw)
+                if total > MAX_ARCHIVE:
+                    return
+                archive.writestr(name, raw)
+        await self.persist_archive(job, stream.getvalue())
 
     async def ensure_container(self, job):
         state = job["state"]
@@ -386,7 +435,7 @@ class CodingService:
         history, memories, _enabled = await self.env._canonical_chat_context(
             identity, job["conversation_id"], job["prompt"])
         phase = state.get("phase", "BUILD")
-        guidance = "Continue implementing the requested project, preserving the existing working files."
+        guidance = "Implement the next small runnable piece, save its source and checkpoint, then end this step."
         if phase == "REVIEW":
             guidance = ("Review the implemented project against EVERY requirement. Execute meaningful checks in the shell, "
                 "fix all failures you can reproduce, and rerun checks. Inspect for incomplete files, placeholders and "
@@ -401,8 +450,13 @@ class CodingService:
         state["checkpoint_id"] = uuid.uuid4().hex
         state["round_content_hash"] = state.get("content_hash")
         guidance += "\nThis step's checkpoint_id is " + state["checkpoint_id"] + "."
+        # The same flagship model builds incrementally at high effort; the final
+        # review retains maximum effort. One huge max-effort build could spend
+        # minutes reasoning before issuing its first command or saving any source.
+        effort = "max" if phase == "REVIEW" else "high"
+        state["reasoning_effort"] = effort
         payload = {"model": self.env.OPENAI_TEXT_DEVELOPER_MODEL, "background": True, "store": True,
-            "reasoning": {"effort": "max"}, "max_output_tokens": 65536,
+            "reasoning": {"effort": effort}, "max_output_tokens": 32768,
             "instructions": CODING_INSTRUCTIONS + self.env._memory_instruction_block(memories),
             "tools": [{"type": "shell", "environment": {"type": "container_reference",
                        "container_id": state["container_id"]}}],
@@ -412,6 +466,12 @@ class CodingService:
             payload["previous_response_id"] = identifier(state["previous_response_id"], "resp_")
         else:
             payload["input"] = history[-12:] + [{"role": "user", "content": job["prompt"] + "\n\n" + guidance}]
+            if not state.get("round"):
+                from link_media import LINK_RULES, link_context
+                linked = await link_context(job["prompt"])
+                if linked:
+                    payload["instructions"] += LINK_RULES + "\nRecord relevant observed reference details in PROJECT_STATE.md for later steps."
+                    payload["input"][-1]["content"] = [{"type": "input_text", "text": job["prompt"] + "\n\n" + guidance}] + linked[0].content()
         state["submitting"] = True
         await self.save(job, state=state, progress="Reviewing and testing" if phase == "REVIEW" else "Building your project")
         try:
@@ -433,6 +493,8 @@ class CodingService:
             await self.save(job, state=state, status="PAUSED", progress=progress)
             return
         state.update(response_id=identifier(response.get("id"), "resp_"), submitting=False, restore_path=None,
+            response_started_at=utcnow(), last_checked_at=utcnow(), activity="Model request accepted",
+            commands_completed=0,
             model=str(response.get("model") or self.env.OPENAI_TEXT_DEVELOPER_MODEL),
             provider_status=str(response.get("status") or "queued"), provider_error_code="")
         # A Stop arriving during POST must retain the returned ID so the next
@@ -487,12 +549,28 @@ class CodingService:
             await self.save(job, state=state, progress="Restoring saved project files after the model session expired")
             return
         status = response.get("status")
+        state["last_checked_at"] = utcnow()
         state["provider_status"] = str(status or "unknown")
         state["model"] = str(response.get("model") or state.get("model") or self.env.OPENAI_TEXT_DEVELOPER_MODEL)
         if status in {"queued", "in_progress"}:
             # Persist provider/tool progress without manufacturing percentage estimates.
             evidence = shell_evidence(response)
-            progress = "Running project commands and checks" if evidence else "Thinking and building your project"
+            calls = [item for item in response.get("output", []) if item.get("type") == "shell_call"]
+            state["commands_completed"] = len(evidence)
+            if status == "queued":
+                activity = "Waiting in the AI provider queue"
+            elif any(item.get("status") == "in_progress" for item in calls):
+                activity = "Executing a project command"
+            elif evidence:
+                activity = f"{len(evidence)} commands finished; preparing the next change"
+            else:
+                activity = "Model is reasoning; no shell commands have run yet"
+            state["activity"] = activity
+            progress = activity
+            if not calls and state.get("response_started_at"):
+                elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(state["response_started_at"])).total_seconds()
+                if elapsed >= 120:
+                    progress += f" ({int(elapsed // 60)} min). You can leave this running or Stop and Resume."
             await self.save(job, state=state, progress=progress)
             # Provider containers are ephemeral; periodically save available checkpoints.
             if time.time() - float(state.get("last_checkpoint", 0)) > 45:
@@ -531,6 +609,7 @@ class CodingService:
         state["provider_failures"] = 0
         evidence = shell_evidence(response)
         state["evidence"] = evidence
+        state["commands_completed"] = len(evidence)
         state["model"] = str(response.get("model") or self.env.OPENAI_TEXT_DEVELOPER_MODEL)
         fresh = False
         try:
