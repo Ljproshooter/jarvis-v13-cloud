@@ -1,6 +1,6 @@
 {
-  "version": "16.0.3",
+  "version": "16.0.4",
   "download_url": "https://jarvis-v13-cloud.onrender.com/v1/client/download",
-  "sha256": "e7005261f150ac7da7fdd2097b36c871f4d0936861b233cdd6c486f694da4492",
-  "notes": "LJ AI V16.0.3 adds saved GPT-6 coding projects, sandbox checks, automatic continuation, Stop/Resume, source ZIP import/download and automatic account memory."
+  "sha256": "442afbe74f08ddc6eaa1db00f8c5177735dfea444bb444d2df8d392908dc9fee",
+  "notes": "LJ AI V16.0.4 fixes coding mode selection and large-reply responsiveness, expands code response budgets, improves saved-project status and SmartThings repeat/transport controls, and retains automatic memory."
 }
