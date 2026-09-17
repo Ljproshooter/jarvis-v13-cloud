@@ -1,6 +1,6 @@
 {
-  "version": "16.0.1",
+  "version": "16.0.2",
   "download_url": "https://jarvis-v13-cloud.onrender.com/v1/client/download",
-  "sha256": "7946a0ac620004a7d68f4accf5fc2ee44da0c33bc2d72a03b091ccda2cf97d14",
-  "notes": "LJ AI V16.0.1 fixes Windows reconnect freezes and online status, restores saved Skill voice execution, adds ticket deletion, and improves supported TV navigation and playback controls."
+  "sha256": "fcffc2021393cdede6d992f380f1e554ee679538394582fab1dc4e2075b501a2",
+  "notes": "LJ AI V16.0.2 fixes saved-login refresh and incorrect clock replies to coding requests, adds shared voice actions to text chat, and expands GPT-6 Developer output."
 }
