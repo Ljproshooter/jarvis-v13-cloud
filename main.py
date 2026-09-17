@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 APP_NAME = "LJ AI V16 Cloud"
-APP_VERSION = "16.0.1"
+APP_VERSION = "16.0.2"
 LJ_AI_WEBSITE = "https://lj-ai-official-site.pages.dev/"
 
 # V15.9.x Windows clients may require /health to report their exact
@@ -41,7 +41,7 @@ LJ_AI_WEBSITE = "https://lj-ai-official-site.pages.dev/"
 # working long enough for those clients to sign in and use the verified updater.
 # Current clients and every non-Windows caller still receive APP_VERSION.
 LEGACY_WINDOWS_HEALTH_VERSIONS = {
-    "15.9.1", "15.9.2", "15.9.3", "15.9.4", "15.9.5", "15.9.6", "15.9.7", "15.9.8", "15.9.9", "16.0.0",
+    "15.9.1", "15.9.2", "15.9.3", "15.9.4", "15.9.5", "15.9.6", "15.9.7", "15.9.8", "15.9.9", "16.0.0", "16.0.1",
 }
 
 # Owner-assisted password changes are intentionally disabled until LJ AI has a
@@ -95,7 +95,7 @@ OPENAI_TEXT_FAST_MODEL = os.getenv("OPENAI_TEXT_FAST_MODEL", OPENAI_VOICE_REPLY_
 OPENAI_TEXT_BALANCED_MODEL = os.getenv("OPENAI_TEXT_BALANCED_MODEL", "gpt-5.6-terra").strip()
 OPENAI_TEXT_SMART_MODEL = os.getenv("OPENAI_TEXT_SMART_MODEL", "gpt-5.6").strip()
 OPENAI_TEXT_DEEP_MODEL = os.getenv("OPENAI_TEXT_DEEP_MODEL", "gpt-6-astra").strip()
-OPENAI_TEXT_DEVELOPER_MODEL = os.getenv("OPENAI_TEXT_DEVELOPER_MODEL", OPENAI_ADMIN_MODEL).strip()
+OPENAI_TEXT_DEVELOPER_MODEL = os.getenv("OPENAI_TEXT_DEVELOPER_MODEL", "gpt-6-astra").strip() or "gpt-6-astra"
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip()
 OPENAI_VOICE_SERVICE_TIER = os.getenv("OPENAI_VOICE_SERVICE_TIER", "fast").strip().casefold()
 if OPENAI_VOICE_SERVICE_TIER not in {"default", "fast"}:
@@ -109,11 +109,11 @@ PAYPAL_CHECKOUT_URL = os.getenv("PAYPAL_CHECKOUT_URL", "").strip()
 SUPPORT_DISCORD = os.getenv("SUPPORT_DISCORD", "ljproshooter7229").strip()
 SUPPORT_INSTAGRAM = os.getenv("SUPPORT_INSTAGRAM", "").strip()
 SUPPORT_TELEGRAM = os.getenv("SUPPORT_TELEGRAM", "").strip()
-CLIENT_LATEST_VERSION = os.getenv("CLIENT_LATEST_VERSION", APP_VERSION).strip()
+CLIENT_LATEST_VERSION = os.getenv("CLIENT_LATEST_VERSION", "16.0.1").strip()
 CLIENT_UPDATE_URL = os.getenv("CLIENT_UPDATE_URL", "").strip()
 CLIENT_UPDATE_SHA256 = os.getenv("CLIENT_UPDATE_SHA256", "").strip().lower()
 CLIENT_UPDATE_NOTES = os.getenv("CLIENT_UPDATE_NOTES", "LJ AI is up to date.").strip()
-ANDROID_LATEST_VERSION_NAME = os.getenv("ANDROID_LATEST_VERSION_NAME", APP_VERSION).strip()
+ANDROID_LATEST_VERSION_NAME = os.getenv("ANDROID_LATEST_VERSION_NAME", "16.0.1").strip()
 ANDROID_LATEST_VERSION_CODE = os.getenv("ANDROID_LATEST_VERSION_CODE", "").strip()
 ANDROID_UPDATE_URL = os.getenv("ANDROID_UPDATE_URL", "").strip()
 ANDROID_UPDATE_SHA256 = os.getenv("ANDROID_UPDATE_SHA256", "").strip().lower()
@@ -1467,9 +1467,18 @@ class AdminRecoveryActionRequest(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    refresh_token: str = Field(min_length=20, max_length=4096)
+    # Supabase refresh tokens are opaque; they are not JWTs and can be shorter
+    # than 20 characters. Supabase validates them after the device credential.
+    refresh_token: str = Field(min_length=1, max_length=4096)
     device_id: str = Field(min_length=8, max_length=128)
     device_token: str = Field(min_length=32, max_length=512)
+
+    @field_validator("refresh_token")
+    @classmethod
+    def nonblank_refresh_token(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("A saved sign-in token is required.")
+        return value
 
 
 class ChatTurn(BaseModel):
@@ -3729,7 +3738,7 @@ async def chat(
         canonical_memory = []
 
     coding_request = bool(re.search(
-        r"\b(code|coding|program|programming|debug|compile|build error|stack trace|python|kotlin|java|javascript|typescript|sql|api)\b",
+        r"\b(code|coding|program|programming|debug|compile|build error|stack trace|python|kotlin|java|javascript|typescript|sql|api|game|js ?bin)\b",
         body.message,
         flags=re.IGNORECASE,
     ))
@@ -3780,7 +3789,9 @@ async def chat(
             response_verbosity = "high"
         else:
             model = OPENAI_TEXT_DEVELOPER_MODEL
-            max_output_tokens = {"CONCISE": 2200, "BALANCED": 6000, "DETAILED": 12000}[body.detail]
+            # This budget includes reasoning. A concise display preference must
+            # not starve maximum reasoning or cut a requested program in half.
+            max_output_tokens = 65536
             history_turns = MAX_HISTORY_TURNS
             reasoning_effort = "max"
             response_verbosity = "high"
@@ -3840,6 +3851,15 @@ async def chat(
         payload["instructions"] += (
             f"\nThis is a coding request using {AI_MODE_LABELS[ai_mode]} mode for a VIP or Administrator account. Diagnose before changing code, "
             "preserve working behaviour, call out security-sensitive assumptions, and include a practical verification step."
+        )
+    if ai_mode == "DEVELOPER" and not body.from_voice:
+        payload["instructions"] += (
+            "\nComplete the requested implementation in this answer using reasonable defaults. "
+            "For a game or app, supply complete runnable code and all requested mechanics, with setup instructions. "
+            "For JS Bin use HTML, CSS and JavaScript panels with no build step unless requested. "
+            "Treat phrases such as 'take your time' as part of the coding request, not a clock question. "
+            "Check the logic for missing functions and undefined names before answering. "
+            "Only claim execution, testing or file creation when an actual tool result confirms it."
         )
 
     if web_request:
@@ -3917,6 +3937,10 @@ async def chat(
         await _refund_chat_usage(identity, request_id, claim_token)
         raise
     reply = _ensure_requested_links(body.message, reply, data)
+    incomplete = str(data.get("status") or "") == "incomplete"
+    if incomplete:
+        reply += "\n\nThe model marked this response as incomplete. Ask me to continue before relying on the full result."
+    model = str(data.get("model") or model)
     usage = data.get("usage") or {}
     input_tokens = int(usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or 0)
@@ -4309,32 +4333,8 @@ def _realtime_supports_v1601_controls(body: RealtimeTokenRequest) -> bool:
     return _realtime_client_version(body) >= (16, 0, 1)
 
 
-@app.post("/v1/realtime/token")
-async def realtime_token(
-    body: RealtimeTokenRequest,
-    identity: Identity = Depends(current_identity),
-) -> dict[str, Any]:
-    """Mint a short-lived Realtime token; the permanent OpenAI key stays on Render."""
-    if identity.effective_plan not in CEDAR_PLANS:
-        raise HTTPException(status_code=403, detail="Realtime OpenAI voice requires Basic, Premium, VIP or Administrator access.")
-    if identity.effective_plan != "ADMIN":
-        usage = await _usage_snapshot(identity.user_id)
-        if int(usage.get("voice_seconds_remaining") or 0) <= 0:
-            raise HTTPException(
-                status_code=429,
-                detail="Your voice allowance is used up for this billing cycle.",
-            )
-    # Starting and stopping the voice screen during setup used to exhaust an
-    # eight-per-hour allowance and silently force the Windows client back to
-    # the slower compatibility pipeline.  Keep an abuse guard, but allow
-    # normal reconnects and testing.
-    await limiter.enforce(f"realtime-token:{identity.user_id}", 120, 3600)
-    if body.conversation_id:
-        await _owned_conversation(identity, body.conversation_id)
-    voice_memories, _memory_enabled = await _server_memory_context(identity)
-    requested_voice = body.voice.casefold()
-    voice = requested_voice if requested_voice in OPENAI_VOICES else OPENAI_REALTIME_VOICE
-    bot_name = body.bot_name.strip() if identity.effective_plan in {"VIP", "ADMIN"} else "LJ AI"
+def _app_action_tools(body: RealtimeTokenRequest, identity: Identity) -> list[dict[str, Any]]:
+    """One capability catalogue for voice and typed actions; local policies execute it."""
     full_access = body.permission_mode == "FULL ACCESS"
     tools = [
         {
@@ -4832,6 +4832,39 @@ async def realtime_token(
                     "appropriate settings action; never claim an action succeeded without the local result. "
                     "Use empty strings for irrelevant target, screen, message and platform fields."
                 )
+    return tools
+
+
+@app.post("/v1/realtime/token")
+async def realtime_token(
+    body: RealtimeTokenRequest,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    """Mint a short-lived Realtime token; the permanent OpenAI key stays on Render."""
+    if identity.effective_plan not in CEDAR_PLANS:
+        raise HTTPException(status_code=403, detail="Realtime OpenAI voice requires Basic, Premium, VIP or Administrator access.")
+    if identity.effective_plan != "ADMIN":
+        usage = await _usage_snapshot(identity.user_id)
+        if int(usage.get("voice_seconds_remaining") or 0) <= 0:
+            raise HTTPException(
+                status_code=429,
+                detail="Your voice allowance is used up for this billing cycle.",
+            )
+    # Starting and stopping the voice screen during setup used to exhaust an
+    # eight-per-hour allowance and silently force the Windows client back to
+    # the slower compatibility pipeline.  Keep an abuse guard, but allow
+    # normal reconnects and testing.
+    await limiter.enforce(f"realtime-token:{identity.user_id}", 120, 3600)
+    if body.conversation_id:
+        await _owned_conversation(identity, body.conversation_id)
+    voice_memories, _memory_enabled = await _server_memory_context(identity)
+    requested_voice = body.voice.casefold()
+    voice = requested_voice if requested_voice in OPENAI_VOICES else OPENAI_REALTIME_VOICE
+    bot_name = body.bot_name.strip() if identity.effective_plan in {"VIP", "ADMIN"} else "LJ AI"
+    full_access = body.permission_mode == "FULL ACCESS"
+    tools = _app_action_tools(body, identity)
+    app_bridge_enabled = bool(body.app_context.strip())
+    v1601_controls = _realtime_supports_v1601_controls(body)
     app_snapshot = body.app_context.strip()
     platform_label = "Windows desktop" if body.client_platform == "WINDOWS" else "Android mobile"
     bridge_action_rules = (
@@ -6019,3 +6052,9 @@ app.include_router(create_mobile_router(current_identity=current_identity, rest_
 app.include_router(create_smartthings_router(current_identity=current_identity, rest_request=_rest_request, insert_audit=_insert_audit, limiter=limiter))
 app.include_router(create_image_generation_router(current_identity=current_identity, limiter=limiter, check_image_allowance=_check_image_allowance, consume_image_allowance=_consume_image_allowance, openai_json=_openai_json, record_api_usage=_record_api_usage, save_chat_log=_save_chat_log, image_model=OPENAI_IMAGE_MODEL, image_tool_model=OPENAI_IMAGE_TOOL_MODEL, image_plans=IMAGE_EDIT_PLANS))
 app.include_router(create_teach_lj_router(current_identity=current_identity, rest_request=_rest_request, rpc=_rpc, insert_audit=_insert_audit, limiter=limiter))
+
+
+# Text actions share the voice catalogue and execute only in the owning client.
+import sys as _sys
+from text_actions import register_text_actions
+text_action_plan = register_text_actions(app, _sys.modules[__name__])
