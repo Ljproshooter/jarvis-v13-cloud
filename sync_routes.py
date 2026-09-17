@@ -37,6 +37,7 @@ SAFE_PREFERENCE_KEYS = {
     "personality",
     "ai_mode",
     "memory_enabled",
+    "automatic_memory_enabled",
     # V15.9.7 Android stores these separately: one controls whether history
     # synchronises and the other controls whether prior turns are referenced
     # when answering. Keep the V15.9.6 key for older clients.
@@ -370,6 +371,7 @@ def create_sync_router(
     rest_request: Callable[..., Any],
     insert_audit: Callable[..., Any],
     consume_voice_usage: Callable[..., Any],
+    learn_memory: Callable[..., Any] | None = None,
 ) -> APIRouter:
     router = APIRouter(tags=["sync"])
 
@@ -632,6 +634,7 @@ def create_sync_router(
             "category": row.get("category") or "OTHER",
             "enabled": bool(row.get("enabled")),
             "source_conversation_id": row.get("source_conversation_id"),
+            "source_kind": row.get("source_kind", "MANUAL"),
             "created_at": row.get("created_at"),
             "updated_at": row.get("updated_at"),
         }
@@ -751,7 +754,7 @@ def create_sync_router(
         if isinstance(value, dict):
             value = next(iter(value.values()), False)
         if value is not True:
-            raise HTTPException(status_code=409, detail="Conversation changed on another device.")
+            raise HTTPException(status_code=409, detail="Stop any coding job in this chat, then refresh and delete the conversation.")
         return None
 
     @router.get("/v1/conversations/{conversation_id}/messages")
@@ -814,7 +817,7 @@ def create_sync_router(
             "lj_memories",
             params={
                 "user_id": f"eq.{user_id}",
-                "select": "id,fact,category,enabled,source_conversation_id,created_at,updated_at",
+                "select": "id,fact,category,enabled,source_conversation_id,source_kind,created_at,updated_at",
                 "order": "updated_at.desc,id.desc",
                 "limit": str(max(1, min(MAX_MEMORIES, limit))),
             },
@@ -827,10 +830,8 @@ def create_sync_router(
     @router.delete("/v1/memories", status_code=204)
     async def clear_memories(identity: Any = Depends(current_identity)) -> None:
         await rest_request(
-            "DELETE",
-            "lj_memories",
-            params={"user_id": f"eq.{_user_id(identity)}"},
-            prefer="return=minimal",
+            "POST", "rpc/forget_lj_memory",
+            payload={"p_user_id": _user_id(identity), "p_all": True},
         )
         return None
 
@@ -909,21 +910,16 @@ def create_sync_router(
         if body.fact is not None:
             changes["fact"] = body.fact
             changes["normalized_fact"] = _normalise_memory_fact(body.fact)
+            changes["source_kind"] = "MANUAL"
         if body.category is not None:
             changes["category"] = body.category
         if body.enabled is not None:
             changes["enabled"] = body.enabled
         try:
-            rows = await rest_request(
-                "PATCH",
-                "lj_memories",
-                params={
-                    "id": f"eq.{current['id']}",
-                    "user_id": f"eq.{_user_id(identity)}",
-                },
-                payload=changes,
-                prefer="return=representation",
-            ) or []
+            updated = await rest_request(
+                "POST", "rpc/edit_lj_memory",
+                payload={"p_user_id": _user_id(identity), "p_memory_id": current["id"], "p_changes": changes})
+            rows = updated if isinstance(updated, list) else ([updated] if updated else [])
         except HTTPException as error:
             raise HTTPException(status_code=409, detail="That memory already exists.") from error
         if not rows:
@@ -937,10 +933,8 @@ def create_sync_router(
     ) -> None:
         current = await require_owned_memory(memory_id, identity)
         await rest_request(
-            "DELETE",
-            "lj_memories",
-            params={"id": f"eq.{current['id']}", "user_id": f"eq.{_user_id(identity)}"},
-            prefer="return=minimal",
+            "POST", "rpc/forget_lj_memory",
+            payload={"p_user_id": _user_id(identity), "p_memory_id": current["id"]},
         )
         return None
 
@@ -1242,6 +1236,15 @@ def create_sync_router(
         exhausted = bool(usage.get("allowance_exhausted"))
         expiry = usage.get("lease_expires_at")
         status = str(usage.get("session_state") or "ACTIVE")
+        if learn_memory is not None and status == "ACTIVE":
+            from automatic_memory import new_voice_memory_turns
+            previous_tail = _clean_transcript_tail(row.get("transcript_tail"))
+            for index, turn in new_voice_memory_turns(previous_tail, body.transcript_tail):
+                if turn.get("role") == "user":
+                    text = str(turn.get("content") or "")
+                    occurrence = json.dumps([previous_tail[-2:], body.transcript_tail[:index+1]], sort_keys=True)
+                    turn_id = "voice-memory-" + hashlib.sha256((session_id + "\0" + occurrence).encode()).hexdigest()[:40]
+                    await learn_memory(identity, text, row.get("conversation_id"), turn_id)
         return {
             "status": status,
             "lease_expires_at": expiry,
