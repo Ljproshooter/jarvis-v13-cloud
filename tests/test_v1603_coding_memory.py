@@ -118,6 +118,32 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         service.checkpoint = AsyncMock(return_value=True)
         return service
 
+    async def test_in_progress_exposes_actual_model_before_completion(self):
+        service, row = self.service(), job()
+        service.api.return_value = response("in_progress")
+        await service.step(row)
+        public = await service.public(row)
+        self.assertEqual(public["model"], "gpt-6-astra")
+        self.assertEqual(public["provider_status"], "in_progress")
+
+    async def test_stopping_before_first_checkpoint_does_not_claim_files_exist(self):
+        service, row = self.service(), job()
+        row["status"] = "STOPPING"
+        row["state"].pop("archive_sha256")
+        await service.step(row)
+        self.assertEqual(row["status"], "STOPPED")
+        self.assertIn("before the first", row["progress"])
+        self.assertFalse((await service.public(row))["has_project"])
+
+    async def test_provider_billing_error_is_actionable_and_does_not_reveal_raw_response(self):
+        service, row = self.service(), job()
+        service.api.return_value = {**response("failed"), "error": {"code": "insufficient_quota", "message": "secret request content"}}
+        await service.step(row)
+        public = await service.public(row)
+        self.assertEqual(public["provider_error_code"], "insufficient_quota")
+        self.assertIn("billing", public["progress"])
+        self.assertNotIn("secret", json.dumps(public))
+
     async def test_token_limit_automatically_continues_saved_work(self):
         service, row = self.service(), job()
         row["state"].update(report=ready_report())
