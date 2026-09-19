@@ -1716,7 +1716,8 @@ async def health(request: Request) -> JSONResponse:
     )
     if legacy_windows and legacy_windows.group(1) in LEGACY_WINDOWS_HEALTH_VERSIONS:
         reported_version = legacy_windows.group(1)
-    return JSONResponse(content={"status": "healthy", "version": reported_version})
+    return JSONResponse(content={"status": "healthy", "version": reported_version,
+        "coding_workflow": CODING_WORKFLOW_REVISION})
 
 
 @app.get("/v1/client/update")
@@ -6110,6 +6111,6 @@ from text_actions import register_text_actions
 text_action_plan = register_text_actions(app, _sys.modules[__name__])
 
 from automatic_memory import register_automatic_memory
-from coding_jobs import register_coding_jobs
+from coding_jobs import WORKFLOW_REVISION as CODING_WORKFLOW_REVISION, register_coding_jobs
 automatic_memory = register_automatic_memory(app, _sys.modules[__name__])
 coding_service = register_coding_jobs(app, _sys.modules[__name__])

@@ -26,11 +26,13 @@ from fastapi import Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 LOG = logging.getLogger("lj.coding")
+LOG.setLevel(logging.INFO)
 MAX_ARCHIVE = 32 * 1024 * 1024
 MAX_EXPANDED = 256 * 1024 * 1024
 ACTIVE = {"QUEUED", "RUNNING", "STOPPING"}
 CHECKPOINT_NAME = "lj_project.zip"
 REPORT_NAME = "lj_progress.json"
+WORKFLOW_REVISION = "16.0.5-runtime-1"
 
 
 def utcnow() -> str:
@@ -102,7 +104,9 @@ def shell_evidence(data: dict) -> list[dict]:
                     "outcome": output.get("outcome", {}),
                     "stdout": str(output.get("stdout") or "")[-12000:],
                     "stderr": str(output.get("stderr") or "")[-4000:]})
-    return evidence[-30:]
+    # Verification needs every execution in this response. Limit diagnostic
+    # storage separately; dropping early tests here can reject a finished review.
+    return evidence
 
 
 def read_report(value: bytes) -> dict:
@@ -125,8 +129,9 @@ def read_report(value: bytes) -> dict:
 
 def verified_checks(report: dict, evidence: list[dict]) -> list[dict]:
     """Match claimed check commands to successful provider-observed executions."""
-    successful = {item.get("command"): item for item in evidence
-                  if item.get("command") and item.get("outcome", {}).get("type") == "exit"
+    latest = {item.get("command"): item for item in evidence if item.get("command")}
+    successful = {command: item for command, item in latest.items()
+                  if item.get("outcome", {}).get("type") == "exit"
                   and item.get("outcome", {}).get("exit_code") == 0}
     return [{"command": check["command"], "description": check.get("description", ""),
              "stdout": successful[check["command"]].get("stdout", "")}
@@ -296,6 +301,9 @@ class CodingService:
             "response_started_at": state.get("response_started_at", ""),
             "last_checked_at": state.get("last_checked_at", ""),
             "reasoning_effort": state.get("reasoning_effort", ""),
+            "workflow_revision": WORKFLOW_REVISION,
+            "continuation_reason": state.get("continuation_reason", ""),
+            "last_step": state.get("last_step", {}),
             "limitations": state.get("report", {}).get("limitations", ""),
             "has_project": bool(state.get("archive_sha256")), "sha256": state.get("archive_sha256", ""),
             "files": state.get("manifest", []), "history_saved": job["status"] == "COMPLETED"}
@@ -442,6 +450,7 @@ class CodingService:
                 "Resume to start a fresh step; the previous request may still be running."))
             return
         await self.ensure_container(job)
+        state = job["state"]
         history, memories, _enabled = await self.env._canonical_chat_context(
             identity, job["conversation_id"], job["prompt"])
         phase = state.get("phase", "BUILD")
@@ -462,10 +471,17 @@ class CodingService:
             guidance += " Restore the saved source ZIP " + json.dumps(state["restore_path"]) + " into /mnt/data/project first."
         if state.get("report"):
             guidance += "\nLast saved progress (context only): " + json.dumps(state["report"], ensure_ascii=False)
+        if state.get("verification_repair"):
+            guidance += ("\nThe implementation review reported ready, but its execution evidence did not match. "
+                "Resolve ONLY the verification issues below; do not redesign the project or add optional tests. "
+                "Run the needed checks as short standalone shell commands, fix any concrete failure, "
+                "then save a fresh matching ZIP/report.\nVerification issues: "
+                + json.dumps(state["verification_repair"], ensure_ascii=False))
         if state.get("parent_prompt"):
             guidance += "\nPrevious request in this project (context; the current user request takes priority): " + json.dumps({
                 "request": state["parent_prompt"], "report": state.get("parent_report")}, ensure_ascii=False)
         state["checkpoint_id"] = uuid.uuid4().hex
+        state["workflow_revision"] = WORKFLOW_REVISION
         state["round_content_hash"] = state.get("content_hash")
         guidance += "\nThis step's checkpoint_id is " + state["checkpoint_id"] + "."
         # The same flagship model builds incrementally at high effort; the final
@@ -586,11 +602,17 @@ class CodingService:
             state["activity"] = activity
             phase_label = "Review" if state.get("phase") == "REVIEW" else "Build"
             progress = f"{phase_label} step {int(state.get('round', 0)) + 1}: {activity}"
+            if state.get("continuation_reason"):
+                progress += ". " + state["continuation_reason"]
             if not calls and state.get("response_started_at"):
                 elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(state["response_started_at"])).total_seconds()
                 if elapsed >= 120:
                     progress += f" ({int(elapsed // 60)} min). You can leave this running or Stop and Resume."
             await self.save(job, state=state, progress=progress)
+            # save() replaces the row with freshly decoded PostgREST JSON. From
+            # here checkpoint() mutates THAT state, not the pre-save local dict.
+            # Reusing the old dict below used to erase the snapshot metadata.
+            state = job["state"]
             # Provider containers are ephemeral; periodically save available checkpoints.
             if time.time() - float(state.get("last_checkpoint", 0)) > 45:
                 with suppress(HTTPException, ValueError, json.JSONDecodeError):
@@ -627,10 +649,11 @@ class CodingService:
             return
         state["provider_failures"] = 0
         evidence = shell_evidence(response)
-        state["evidence"] = evidence
+        state["evidence"] = evidence[-30:]
         state["commands_completed"] = len(evidence)
         state["model"] = str(response.get("model") or self.env.OPENAI_TEXT_DEVELOPER_MODEL)
         fresh = False
+        checkpoint_issue = ""
         try:
             fresh = await self.checkpoint(job)
         except (ValueError, json.JSONDecodeError):
@@ -638,10 +661,12 @@ class CodingService:
             # the last good snapshot and let the next step repair the checkpoint.
             state["report"] = {"status": "continue", "next_steps":
                 "Finish saving the source ZIP and a valid matching progress report before proceeding."}
+            checkpoint_issue = "The project archive or progress report was invalid."
         except HTTPException as error:
             if error.status_code not in {404, 410}:
                 raise
             state.update(container_id=None, previous_response_id=None)
+            checkpoint_issue = "The sandbox expired before its final checkpoint could be read."
         state["round"] = int(state.get("round", 0)) + 1
         changed = bool(state.get("content_hash")) and state.get("content_hash") != state.get("round_content_hash")
         state["unchanged"] = 0 if changed else int(state.get("unchanged", 0)) + 1
@@ -655,13 +680,30 @@ class CodingService:
                 output_tokens=int(usage.get("output_tokens") or 0))
             state["metered_response"] = rid
         report = state.get("report") or {}
+        state["last_step"] = {"round": state["round"], "phase": state.get("phase", "BUILD"),
+            "provider_status": status, "report_status": report.get("status", "missing"),
+            "fresh_checkpoint": fresh, "commands_completed": len(evidence),
+            "files_saved": len(state.get("manifest") or []), "checked_at": utcnow()}
+
+        def record_outcome(reason, message):
+            state["last_step"]["outcome"] = reason
+            state["continuation_reason"] = message
+            # No prompts, command bodies, tokens, user identity or provider IDs.
+            LOG.info("Coding step result job=%s revision=%s step=%s phase=%s provider=%s "
+                "report=%s checkpoint=%s commands=%s files=%s outcome=%s", job["id"],
+                WORKFLOW_REVISION, state["round"], state["last_step"]["phase"], status,
+                state["last_step"]["report_status"], fresh, len(evidence),
+                state["last_step"]["files_saved"], reason)
+
         if fresh and report.get("status") == "needs_input":
+            record_outcome("needs_input", "The last step needs your input.")
             await self.save(job, state=state, status="PAUSED", progress=report.get("next_steps") or report.get("summary"))
             return
         if status == "completed" and fresh and report.get("status") == "ready" and state.get("archive_sha256"):
             if state.get("phase") != "REVIEW":
                 state["phase"] = "REVIEW"
                 state["unchanged"] = 0
+                record_outcome("ready_for_review", "Implementation is saved; final review is checking it.")
                 await self.save(job, state=state, progress="Implementation saved. Checking requirements and running tests.")
                 return
             checks = verified_checks(report, evidence)
@@ -671,7 +713,19 @@ class CodingService:
                 state["report"]["next_steps"] = (
                     "Execute meaningful available project checks in this response. List the exact executed commands "
                     "in checks; each listed command must succeed. Fix failures and regenerate the ZIP/report.")
+                matched = {item["command"] for item in checks}
+                latest = {item["command"]: item for item in evidence}
+                state["verification_repair"] = [{"command": item.get("command", ""),
+                    "reason": ("Latest execution failed or timed out" if item.get("command") in latest
+                               else "No exactly matching executed command in this response")}
+                    for item in report.get("checks", []) if item.get("command") not in matched]
+                if not state["verification_repair"]:
+                    state["verification_repair"] = [{"reason": "The report listed no executed checks"}]
+                record_outcome("verification_missing", "Review needs matching successful test evidence before delivery.")
             else:
+                state.pop("verification_repair", None)
+                state["last_step"]["outcome"] = "completed"
+                state["continuation_reason"] = "Project completed and saved."
                 reply = (report.get("summary") or "Your project files are ready.")
                 reply += "\n\nChecks: " + report.get("tests", "See the saved project report.")
                 if report.get("limitations"):
@@ -683,14 +737,28 @@ class CodingService:
                 if not self.env._rpc_boolean(finished):
                     raise LostLease()
                 job["status"] = "COMPLETED"
+                record_outcome("completed", "Project completed and saved.")
                 return
+        elif not fresh:
+            record_outcome("checkpoint_missing", checkpoint_issue or
+                "The last step did not produce a matching ZIP and progress report; repairing the checkpoint.")
+            state["report"] = {**report, "status": "continue", "next_steps":
+                "Keep all existing implementation. Repair the checkpoint: save /mnt/data/lj_project.zip, "
+                "then a valid matching progress report at /mnt/data/lj_progress.json with this step's "
+                "checkpoint_id and the ZIP's actual SHA-256. "
+                "Do not start extra implementation or testing merely because the checkpoint was missing. "
+                "If the requested work and available checks are complete, report ready."}
+        elif status == "incomplete":
+            record_outcome("response_incomplete", "The last response reached its per-response limit; continuing saved work.")
+        else:
+            record_outcome("implementation_remaining", "Continuing unfinished work from the last saved checkpoint.")
         # Prevent spending forever on repeated identical work. This is a recoverable
         # stalled-work pause, not a deadline or a maximum project length.
         if int(state.get("unchanged", 0)) >= 4:
             await self.save(job, state=state, status="PAUSED", progress=(
                 "The last steps did not change the saved files. Review the project or clarify the request, then Resume."))
         else:
-            await self.save(job, state=state, progress="Saved progress. Continuing the next part of the project.")
+            await self.save(job, state=state, progress=state["continuation_reason"])
 
     async def process(self, job):
         heartbeat = asyncio.create_task(self.heartbeat(job))
